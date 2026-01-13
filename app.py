@@ -1,210 +1,192 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
+import yfinance as yf
+from pandas_datareader import data as pdr
 from sklearn.linear_model import Ridge
 from sklearn.preprocessing import StandardScaler
-import statsmodels.api as sm
+from sklearn.metrics import mean_squared_error, mean_absolute_error
 import matplotlib.pyplot as plt
+from datetime import datetime
 
-st.set_page_config(layout="wide", page_title="Projeção Ibovespa")
+# -------------------
+# Configurações do App
+# -------------------
+st.set_page_config(layout="wide")
+st.title("Projeção Ex-Ante do Ibovespa com Dados Macro Públicos")
 
-# ------------------------------
-# Funções auxiliares
-# ------------------------------
+# -------------------
+# Sidebar Inputs
+# -------------------
+st.sidebar.header("Parâmetros Macro Econômicos (ex-ante)")
+window_type = st.sidebar.selectbox("Tipo de Janela para Backtest:", ["Expanding", "Rolling"])
+rolling_window_size = st.sidebar.slider("Tamanho da Rolling Window (meses)", 12, 60, 36)
 
-# Métricas
-def rmse(y_true, y_pred):
-    return np.sqrt(np.mean((y_true - y_pred)**2))
+# Inputs do usuário para projeção atual
+st.sidebar.header("Parâmetros de Entrada do Usuário")
+juros_input = st.sidebar.number_input("Taxa de Juros Brasil (%)", 0.0, 20.0, 5.0, 0.1)
+dolar_input = st.sidebar.number_input("Cotação do Dólar (R$)", 0.0, 10.0, 5.0, 0.01)
+pib_input = st.sidebar.number_input("Variação do PIB (%)", -10.0, 10.0, 2.0, 0.1)
+inflacao_input = st.sidebar.number_input("Inflação (%)", 0.0, 20.0, 4.0, 0.1)
+juros_americano_input = st.sidebar.number_input("Juros Americano (%)", 0.0, 20.0, 3.0, 0.1)
 
-def mae(y_true, y_pred):
-    return np.mean(np.abs(y_true - y_pred))
+# -------------------
+# Função para baixar dados
+# -------------------
+@st.cache_data(show_spinner=True)
+def load_data():
+    # Ibovespa e Dólar
+    ibov = yf.download("^BVSP", start="2000-01-01", progress=False)
+    dolar = yf.download("USDBRL=X", start="2000-01-01", progress=False)
+    df = pd.DataFrame({
+        "ibov": ibov["Adj Close"],
+        "dolar": dolar["Adj Close"]
+    }).dropna()
+    df.index = pd.to_datetime(df.index)
+    df = df.resample('M').last()
 
-# Backtest Ridge (expanding ou rolling)
-def backtest_ridge(df, features, h, alpha=1.0, window_type="Expanding", window_size=120):
-    results = []
-    for t in range(window_size, len(df)-h):
-        if window_type=="Expanding":
-            train = df.iloc[:t]
-        else:
-            train = df.iloc[t-window_size:t]
+    # Juros americano via FRED
+    try:
+        juros_usa = pdr.DataReader("FEDFUNDS", "fred", df.index.min(), df.index.max())
+    except:
+        juros_usa = pd.DataFrame(3.0, index=df.index, columns=["FEDFUNDS"])
+    juros_usa = juros_usa.resample('M').ffill()
 
-        y_train = train['r_ibov'].iloc[:-h]
-        X_train = train[features].iloc[:-h]
+    # Dados brasileiros via BCData (IPCA, SELIC, PIB)
+    # IPCA: código 433 (mensal)
+    try:
+        from bcdata import sgs
+        ipca = sgs.get({'IPCA': 433}, start=df.index.min(), end=df.index.max())
+        ipca.index = pd.to_datetime(ipca.index)
+        ipca = ipca.resample('M').ffill()
+    except:
+        ipca = pd.DataFrame(4.0, index=df.index, columns=["IPCA"])
 
-        scaler = StandardScaler()
-        X_scaled = scaler.fit_transform(X_train)
-        model = Ridge(alpha=alpha)
-        model.fit(X_scaled, y_train)
+    # SELIC: código 4189 (mensal)
+    try:
+        selic = sgs.get({'SELIC': 4189}, start=df.index.min(), end=df.index.max())
+        selic.index = pd.to_datetime(selic.index)
+        selic = selic.resample('M').ffill()
+    except:
+        selic = pd.DataFrame(5.0, index=df.index, columns=["SELIC"])
 
-        X_t = scaler.transform(df[features].iloc[t].values.reshape(1,-1))
-        forecast_return = model.predict(X_t)[0]
+    # PIB trimestral (ex: 438)
+    try:
+        pib = sgs.get({'PIB': 438}, start=df.index.min(), end=df.index.max())
+        pib.index = pd.to_datetime(pib.index)
+        pib = pib.resample('M').ffill()  # converter para mensal
+    except:
+        pib = pd.DataFrame(2.0, index=df.index, columns=["PIB"])
 
-        ibov_t = df['ibov'].iloc[t]
-        ibov_real = df['ibov'].iloc[t+h]
-        results.append({
-            'date': df.index[t],
-            'forecast_return': forecast_return,
-            'real_return': np.log(ibov_real) - np.log(ibov_t),
-            'forecast_ibov': ibov_t * np.exp(forecast_return)
-        })
-    return pd.DataFrame(results)
+    # Juntar tudo
+    df = df.join([selic.rename(columns={'SELIC':'juros_brasil'}), 
+                  dolar.rename(columns={'Adj Close':'dolar'}), 
+                  pib.rename(columns={'PIB':'pib'}), 
+                  ipca.rename(columns={'IPCA':'inflacao'}), 
+                  juros_usa.rename(columns={'FEDFUNDS':'juros_americano'})], how='left')
+    df = df.dropna()
+    df['ibov_ret'] = df['ibov'].pct_change()
+    df = df.dropna()
+    return df
 
-# Random Walk
-def random_walk_forecast(df, h, start_window=120):
-    results = []
-    for t in range(start_window, len(df)-h):
-        ibov_t = df.iloc[t]['ibov']
-        ibov_real = df.iloc[t+h]['ibov']
-        results.append({
-            'date': df.index[t],
-            'forecast_return': 0.0,
-            'real_return': np.log(ibov_real) - np.log(ibov_t),
-            'forecast_ibov': ibov_t
-        })
-    return pd.DataFrame(results)
+df = load_data()
 
-# AR(1)
-def ar1_forecast(df, h, start_window=120):
-    results = []
-    for t in range(start_window, len(df)-h):
-        train = df['r_ibov'].iloc[:t].dropna()
-        model = sm.tsa.ARIMA(train, order=(1,0,0)).fit()
-        r_forecast = model.forecast()[0]
-        forecast_return = h * r_forecast
+# -------------------
+# Preparar X e y
+# -------------------
+X = df[["juros_brasil", "dolar", "pib", "inflacao", "juros_americano"]]
+y = df["ibov_ret"]
 
-        ibov_t = df['ibov'].iloc[t]
-        ibov_real = df['ibov'].iloc[t+h]
-        results.append({
-            'date': df.index[t],
-            'forecast_return': forecast_return,
-            'real_return': np.log(ibov_real) - np.log(ibov_t),
-            'forecast_ibov': ibov_t * np.exp(forecast_return)
-        })
-    return pd.DataFrame(results)
+scaler = StandardScaler()
+X_scaled = scaler.fit_transform(X)
 
-# Subperiodos
-SUBPERIODS = {
-    "Crisis_2008": ("2008-09-01", "2009-06-30"),
-    "Covid": ("2020-03-01", "2021-06-30"),
-    "Election_2002": ("2002-04-01", "2003-03-31"),
-    "Election_2006": ("2006-04-01", "2007-03-31"),
-    "Election_2010": ("2010-04-01", "2011-03-31"),
-    "Election_2014": ("2014-04-01", "2015-03-31"),
-    "Election_2018": ("2018-04-01", "2019-03-31"),
-    "Election_2022": ("2022-04-01", "2023-03-31"),
-}
+# -------------------
+# Função de Backtest
+# -------------------
+def backtest_ridge(X, y, horizon_months, alpha, window_type="Expanding", rolling_size=36):
+    preds = []
+    test_idx = []
 
-def evaluate_subperiods(results, subperiods):
-    evals = []
-    for name, (start, end) in subperiods.items():
-        mask = (results['date'] >= start) & (results['date'] <= end)
-        sub = results.loc[mask]
-        if len(sub)<5: 
-            continue
-        evals.append({
-            'period': name,
-            'observations': len(sub),
-            'RMSE': rmse(sub['real_return'], sub['forecast_return']),
-            'MAE': mae(sub['real_return'], sub['forecast_return']),
-            'Directional_Accuracy': (np.sign(sub['real_return'])==np.sign(sub['forecast_return'])).mean()
-        })
-    return pd.DataFrame(evals)
+    if window_type=="Expanding":
+        start_idx = 60
+        for i in range(start_idx, len(y)-horizon_months):
+            X_train = X[:i]
+            y_train = y[:i]
+            X_test = X[i:i+horizon_months]
+            model = Ridge(alpha=alpha)
+            model.fit(X_train, y_train)
+            y_pred = model.predict(X_test)
+            preds.extend(y_pred)
+            test_idx.extend(y.index[i:i+horizon_months])
+    else: # Rolling
+        for i in range(rolling_size, len(y)-horizon_months):
+            X_train = X[i-rolling_size:i]
+            y_train = y[i-rolling_size:i]
+            X_test = X[i:i+horizon_months]
+            model = Ridge(alpha=alpha)
+            model.fit(X_train, y_train)
+            y_pred = model.predict(X_test)
+            preds.extend(y_pred)
+            test_idx.extend(y.index[i:i+horizon_months])
 
-# Adiciona banda de confiança
-def add_confidence_band(results, confidence=0.95):
-    z = {0.68:1,0.9:1.645,0.95:1.96}[confidence]
-    sigma = np.std(results['forecast_return'] - results['real_return'])
-    results['upper'] = results['forecast_ibov'] * np.exp(z*sigma)
-    results['lower'] = results['forecast_ibov'] * np.exp(-z*sigma)
-    return results
+    y_true = y.loc[test_idx]
+    y_pred_series = pd.Series(preds, index=test_idx)
+    rmse = np.sqrt(mean_squared_error(y_true, y_pred_series))
+    mae = mean_absolute_error(y_true, y_pred_series)
 
-# ------------------------------
-# Carregar dados
-# ------------------------------
+    return y_pred_series, y_true, rmse, mae
 
-@st.cache_data
-def load_base_results():
-    return pd.read_parquet("data/processed_base_results.parquet")
+# -------------------
+# Backtest 1,6,12 meses
+# -------------------
+alphas = {"1 mês":0.5, "6 meses":0.5, "12 meses":1.0}
+horizons = {"1 mês":1, "6 meses":6, "12 meses":12}
 
-@st.cache_data
-def load_macro_data():
-    return pd.read_parquet("data/macro_data.parquet")
+st.header("Backtest Ex-Ante do Modelo Ridge")
+results = {}
 
-base_results = load_base_results()
-macro_data = load_macro_data()
-ALL_FEATURES = [c for c in macro_data.columns if c not in ['ibov','r_ibov']]
+for label, horizon in horizons.items():
+    y_pred, y_true, rmse, mae = backtest_ridge(X_scaled, y, horizon, alphas[label],
+                                               window_type=window_type,
+                                               rolling_size=rolling_window_size)
+    results[label] = {"y_pred":y_pred, "y_true":y_true, "rmse":rmse, "mae":mae}
+    st.subheader(f"Horizonte: {label}")
+    st.write(f"RMSE: {rmse:.5f} | MAE: {mae:.5f}")
 
-# ------------------------------
-# Layout Streamlit
-# ------------------------------
+    resid = y_true - y_pred
+    std_resid = resid.std()
+    lower = y_pred - 1.96*std_resid
+    upper = y_pred + 1.96*std_resid
 
-st.title("📈 Projeção do Ibovespa — Estudo Econométrico")
+    fig, ax = plt.subplots(figsize=(10,4))
+    ax.plot(y_true.index, y_true, label="Real", color="black")
+    ax.plot(y_pred.index, y_pred, label="Previsto", color="blue")
+    ax.fill_between(y_pred.index, lower, upper, color='blue', alpha=0.2, label="Intervalo 95%")
+    ax.set_title(f"Backtest Ridge - Horizonte {label}")
+    ax.legend()
+    st.pyplot(fig)
 
-tab1, tab2, tab3, tab4 = st.tabs([
-    "📘 Estudo Base",
-    "⚠️ Crises & Eleições",
-    "🧪 Projeção do Usuário",
-    "📊 Comparação"
-])
+# -------------------
+# Projeção atual com input do usuário
+# -------------------
+st.header("Projeção Atual com Inputs do Usuário")
 
-# ------------------------------
-# Tab 1 — Estudo Base
-# ------------------------------
-with tab1:
-    st.subheader("Backtest Ex Ante — Modelo Base")
-    h_base = st.selectbox("Horizonte (meses) - Base", [1,6,12], key="base_h")
-    data_base = base_results[base_results["horizon"]==h_base]
-    st.line_chart(data_base.set_index("date")[["real_ibov","forecast_ibov"]], height=400)
+X_user = np.array([[juros_input, dolar_input, pib_input, inflacao_input, juros_americano_input]])
+X_user_scaled = scaler.transform(X_user)
 
-# ------------------------------
-# Tab 2 — Crises & Eleições
-# ------------------------------
-with tab2:
-    st.subheader("Performance em Subperíodos")
-    period = st.selectbox("Selecionar período", list(SUBPERIODS.keys()))
-    start,end = SUBPERIODS[period]
-    sub = data_base[(data_base["date"]>=start)&(data_base["date"]<=end)]
-    st.metric("RMSE", f"{rmse(sub.real_return, sub.forecast_return):.4f}")
-    st.metric("MAE", f"{mae(sub.real_return, sub.forecast_return):.4f}")
-    st.line_chart((sub.forecast_return - sub.real_return).cumsum(), height=300)
+model_final = Ridge(alpha=alphas["1 mês"])
+model_final.fit(X_scaled, y)
 
-# ------------------------------
-# Tab 3 — Projeção do Usuário
-# ------------------------------
-with st.sidebar:
-    st.header("🧪 Projeção do Usuário")
-    user_h = st.selectbox("Horizonte", [1,6,12], key="user_h")
-    alpha = st.slider("α (Ridge)", 0.01, 50.0, 1.0)
-    window_type = st.radio("Janela", ["Expanding","Rolling"])
-    window_size = st.slider("Rolling window (meses)", 60,180,120)
-    selected_features = st.multiselect("Variáveis", ALL_FEATURES, default=ALL_FEATURES)
-    confidence = st.selectbox("Bandas de Confiança", [0.68,0.9,0.95], index=2)
-    run_user = st.button("Gerar Projeção do Usuário")
+pred_user = model_final.predict(X_user_scaled)[0]
+ultimo_preco = df['ibov'].iloc[-1]
+preco_proj = ultimo_preco*(1+pred_user)
 
-with tab3:
-    if run_user:
-        macro_df = macro_data.copy()
-        results_user = backtest_ridge(
-            df=macro_df,
-            features=selected_features,
-            h=user_h,
-            alpha=alpha,
-            window_type=window_type,
-            window_size=window_size
-        )
-        results_user = add_confidence_band(results_user, confidence=confidence)
-        st.subheader("Resultado — Projeção do Usuário")
-        st.line_chart(results_user.set_index("date")[["forecast_ibov","upper","lower","real_ibov"]], height=400)
+st.write(f"Projeção retorno mensal Ibovespa (1 mês): **{pred_user*100:.3f}%**")
+st.write(f"Preço estimado Ibovespa em 1 mês: **{preco_proj:.2f}**")
 
-# ------------------------------
-# Tab 4 — Comparação
-# ------------------------------
-with tab4:
-    st.subheader("Base vs Projeção do Usuário")
-    if run_user:
-        compare = data_base.merge(
-            results_user,
-            on="date",
-            suffixes=("_base","_user")
-        )
-        st.line_chart(compare.set_index("date")[["forecast_ibov_base","forecast_ibov_user","real_ibov_base"]], height=400)
+resid_all = y - model_final.predict(X_scaled)
+std_resid_all = resid_all.std()
+ic_lower = pred_user - 1.96*std_resid_all
+ic_upper = pred_user + 1.96*std_resid_all
+
+st.write(f"Intervalo de confiança 95% retorno mensal: [{ic_lower*100:.3f}%, {ic_upper*100:.3f}%]")
