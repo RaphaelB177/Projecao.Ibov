@@ -1,181 +1,210 @@
-
 import streamlit as st
-import yfinance as yf
 import pandas as pd
 import numpy as np
-import plotly.graph_objects as go
-from bcb import Expectativas
-from datetime import datetime
+from sklearn.linear_model import Ridge
+from sklearn.preprocessing import StandardScaler
+import statsmodels.api as sm
+import matplotlib.pyplot as plt
 
-# Configuração da Página
-st.set_page_config(page_title="Ibov 2026 Strategy", layout="wide")
+st.set_page_config(layout="wide", page_title="Projeção Ibovespa")
 
-# --- FUNÇÕES DE COLETA DE DADOS ---
-@st.cache_data(ttl=3600)
-def get_focus_data():
-    """Busca expectativas do Focus para 2026 via API do BCB"""
-    try:
-        em = Expectativas.get_endpoint('ExpectativasMercadoAnuais')
-        # Buscando Mediana para final de 2026
-        df = em.query().filter(em.DataReferencia == '2026').collect()
-        # Filtrando indicadores chave
-        selic = df[df['Indicador'] == 'Selic']['Mediana'].iloc[-1]
-        ipca = df[df['Indicador'] == 'IPCA']['Mediana'].iloc[-1]
-        pib = df[df['Indicador'] == 'PIB Total']['Mediana'].iloc[-1]
-        return {"selic": selic, "ipca": ipca, "pib": pib}
-    except:
-        return {"selic": 12.25, "ipca": 4.05, "pib": 1.80} # Fallback jan/26
+# ------------------------------
+# Funções auxiliares
+# ------------------------------
 
-def get_market_data():
-    """Busca cotações em tempo real via Yahoo Finance"""
-    tickers = {
-        "^BVSP": "Ibovespa",
-        "USDBRL=X": "Dólar",
-        "BZ=F": "Brent",
-        "^TNX": "US 10Y (Treasury)",
-        "VALE3.SA": "Vale",
-        "PETR4.SA": "Petrobras"
-    }
-    data = yf.download(list(tickers.keys()), period="5d")['Close']
-    return data.iloc[-1], tickers
+# Métricas
+def rmse(y_true, y_pred):
+    return np.sqrt(np.mean((y_true - y_pred)**2))
 
-# --- INTERFACE DO DASHBOARD ---
-st.title("📊 Monitor de Convergência: Ibovespa Dezembro 2026")
-st.markdown(f"**Data da Consulta:** {datetime.now().strftime('%d/%m/%Y %H:%M')}")
+def mae(y_true, y_pred):
+    return np.mean(np.abs(y_true - y_pred))
 
-# Coleta de Dados
-focus = get_focus_data()
-current_prices, ticker_names = get_market_data()
+# Backtest Ridge (expanding ou rolling)
+def backtest_ridge(df, features, h, alpha=1.0, window_type="Expanding", window_size=120):
+    results = []
+    for t in range(window_size, len(df)-h):
+        if window_type=="Expanding":
+            train = df.iloc[:t]
+        else:
+            train = df.iloc[t-window_size:t]
 
-# --- SIDEBAR: PREMISSAS E BETAS (ESTATÍSTICA) ---
-st.sidebar.header("⚙️ Parâmetros do Modelo (Betas)")
-st.sidebar.info("Ajuste os coeficientes de sensibilidade baseados na nossa regressão histórica.")
-beta_selic = st.sidebar.slider("Sensibilidade Selic (Pts/% )", -10000, -2000, -5500)
-beta_commodities = st.sidebar.slider("Sensibilidade Brent (Pts/$ )", 100, 1000, 450)
-target_consenso = st.sidebar.number_input("Target Consenso (Pts)", value=185000)
+        y_train = train['r_ibov'].iloc[:-h]
+        X_train = train[features].iloc[:-h]
 
-# --- MÉTRICAS PRINCIPAIS ---
-col1, col2, col3, col4 = st.columns(4)
-ibov_atual = current_prices['^BVSP']
-dolar_atual = current_prices['USDBRL=X']
+        scaler = StandardScaler()
+        X_scaled = scaler.fit_transform(X_train)
+        model = Ridge(alpha=alpha)
+        model.fit(X_scaled, y_train)
 
-col1.metric("Ibovespa Real-Time", f"{ibov_atual:,.0f}", f"{(ibov_atual/target_consenso - 1):.2%}")
-col2.metric("Dólar PTAX", f"R$ {dolar_atual:.2f}", "-0.15%")
-col3.metric("Selic Projetada (Focus)", f"{focus['selic']}%")
-col4.metric("PIB Projetado 2026", f"{focus['pib']}%")
+        X_t = scaler.transform(df[features].iloc[t].values.reshape(1,-1))
+        forecast_return = model.predict(X_t)[0]
 
-# --- CÁLCULO DA PROJEÇÃO ROLLING (MACRO + ESTATÍSTICA) ---
-# Modelo simplificado de valor justo baseado em desvios do Focus
-desvio_juros = (13.75 - focus['selic']) # Ex: DI atual vs Focus
-ajuste_selic = desvio_juros * beta_selic
-projeção_final = target_consenso + ajuste_selic
+        ibov_t = df['ibov'].iloc[t]
+        ibov_real = df['ibov'].iloc[t+h]
+        results.append({
+            'date': df.index[t],
+            'forecast_return': forecast_return,
+            'real_return': np.log(ibov_real) - np.log(ibov_t),
+            'forecast_ibov': ibov_t * np.exp(forecast_return)
+        })
+    return pd.DataFrame(results)
 
-# --- GRÁFICO DE LEQUE (FAN CHART) ---
-st.subheader("🎯 Projeção Rolling e Bandas de Probabilidade")
+# Random Walk
+def random_walk_forecast(df, h, start_window=120):
+    results = []
+    for t in range(start_window, len(df)-h):
+        ibov_t = df.iloc[t]['ibov']
+        ibov_real = df.iloc[t+h]['ibov']
+        results.append({
+            'date': df.index[t],
+            'forecast_return': 0.0,
+            'real_return': np.log(ibov_real) - np.log(ibov_t),
+            'forecast_ibov': ibov_t
+        })
+    return pd.DataFrame(results)
 
-fig = go.Figure()
+# AR(1)
+def ar1_forecast(df, h, start_window=120):
+    results = []
+    for t in range(start_window, len(df)-h):
+        train = df['r_ibov'].iloc[:t].dropna()
+        model = sm.tsa.ARIMA(train, order=(1,0,0)).fit()
+        r_forecast = model.forecast()[0]
+        forecast_return = h * r_forecast
 
-# Dados Históricos (Simulados para visualização do fluxo)
-months = pd.date_range(start="2025-01-01", end="2026-12-01", freq='MS')
-hist_data = [130000 + (i*1500) + (np.random.randint(-2000, 2000)) for i in range(13)] # Até Jan/26
-proj_data = [hist_data[-1]] # Início da projeção
+        ibov_t = df['ibov'].iloc[t]
+        ibov_real = df['ibov'].iloc[t+h]
+        results.append({
+            'date': df.index[t],
+            'forecast_return': forecast_return,
+            'real_return': np.log(ibov_real) - np.log(ibov_t),
+            'forecast_ibov': ibov_t * np.exp(forecast_return)
+        })
+    return pd.DataFrame(results)
 
-# Gerando curva de projeção
-for i in range(len(months) - 13):
-    step = (projeção_final - hist_data[-1]) / 11
-    proj_data.append(proj_data[-1] + step)
+# Subperiodos
+SUBPERIODS = {
+    "Crisis_2008": ("2008-09-01", "2009-06-30"),
+    "Covid": ("2020-03-01", "2021-06-30"),
+    "Election_2002": ("2002-04-01", "2003-03-31"),
+    "Election_2006": ("2006-04-01", "2007-03-31"),
+    "Election_2010": ("2010-04-01", "2011-03-31"),
+    "Election_2014": ("2014-04-01", "2015-03-31"),
+    "Election_2018": ("2018-04-01", "2019-03-31"),
+    "Election_2022": ("2022-04-01", "2023-03-31"),
+}
 
-# Plotando
-fig.add_trace(go.Scatter(x=months[:13], y=hist_data, name="Histórico Real", line=dict(color='white', width=3)))
-fig.add_trace(go.Scatter(x=months[12:], y=proj_data, name="Projeção Rolling", line=dict(color='cyan', dash='dash')))
+def evaluate_subperiods(results, subperiods):
+    evals = []
+    for name, (start, end) in subperiods.items():
+        mask = (results['date'] >= start) & (results['date'] <= end)
+        sub = results.loc[mask]
+        if len(sub)<5: 
+            continue
+        evals.append({
+            'period': name,
+            'observations': len(sub),
+            'RMSE': rmse(sub['real_return'], sub['forecast_return']),
+            'MAE': mae(sub['real_return'], sub['forecast_return']),
+            'Directional_Accuracy': (np.sign(sub['real_return'])==np.sign(sub['forecast_return'])).mean()
+        })
+    return pd.DataFrame(evals)
 
-# Bandas de Estresse (Estatística: 1 e 2 Desvios Padrão)
-fig.add_trace(go.Scatter(x=months[12:], y=[p*1.10 for p in proj_data], fill=None, mode='lines', line_color='rgba(0,255,0,0.1)', name="Cenário Bull"))
-fig.add_trace(go.Scatter(x=months[12:], y=[p*0.90 for p in proj_data], fill='tonexty', mode='lines', line_color='rgba(255,0,0,0.1)', name="Cenário Bear"))
+# Adiciona banda de confiança
+def add_confidence_band(results, confidence=0.95):
+    z = {0.68:1,0.9:1.645,0.95:1.96}[confidence]
+    sigma = np.std(results['forecast_return'] - results['real_return'])
+    results['upper'] = results['forecast_ibov'] * np.exp(z*sigma)
+    results['lower'] = results['forecast_ibov'] * np.exp(-z*sigma)
+    return results
 
-fig.update_layout(template="plotly_dark", hovermode="x unified", yaxis_title="Pontos Ibovespa")
-st.plotly_chart(fig, use_container_width=True)
+# ------------------------------
+# Carregar dados
+# ------------------------------
 
-# --- RELATÓRIO DE CONVERGÊNCIA (INSIGHTS) ---
-st.subheader("🧠 Análise do Modelo")
-c1, c2 = st.columns(2)
+@st.cache_data
+def load_base_results():
+    return pd.read_parquet("data/processed_base_results.parquet")
 
-with c1:
-    st.write("**Análise de Risco:**")
-    if 13.75 > focus['selic']:
-        st.error(f"O mercado futuro de juros (DI) está precificando {13.75}%, enquanto o Focus espera {focus['selic']}%. Este descolamento retira aproximadamente {abs(ajuste_selic):,.0f} pontos do valuation alvo.")
-    else:
-        st.success("A curva de juros está convergindo com as expectativas do BCB.")
+@st.cache_data
+def load_macro_data():
+    return pd.read_parquet("data/macro_data.parquet")
 
-with c2:
-    st.write("**Impacto de Commodities:**")
-    brent_atual = current_prices['BZ=F']
-    st.warning(f"O Brent a US$ {brent_atual:.2f} atua como suporte. Se houver quebra da barreira de US$ 90, o modelo sugere um acréscimo de {(90-brent_atual)*beta_commodities:,.0f} pontos via PETR4 e VALE3.")
+base_results = load_base_results()
+macro_data = load_macro_data()
+ALL_FEATURES = [c for c in macro_data.columns if c not in ['ibov','r_ibov']]
 
+# ------------------------------
+# Layout Streamlit
+# ------------------------------
 
-st.info("Nota: Este dashboard utiliza regressão linear simples. Em anos eleitorais (2026), o prêmio de risco político pode causar desvios não capturados por modelos macroeconômicos puros.")
+st.title("📈 Projeção do Ibovespa — Estudo Econométrico")
 
+tab1, tab2, tab3, tab4 = st.tabs([
+    "📘 Estudo Base",
+    "⚠️ Crises & Eleições",
+    "🧪 Projeção do Usuário",
+    "📊 Comparação"
+])
 
-# --- TABELA DE SENSIBILIDADE ---
-st.divider()
-st.subheader("🎲 Matriz de Sensibilidade: Ibovespa 2026")
-st.markdown("Impacto cruzado de variações no **Dólar** e na **Selic** sobre o alvo do modelo.")
+# ------------------------------
+# Tab 1 — Estudo Base
+# ------------------------------
+with tab1:
+    st.subheader("Backtest Ex Ante — Modelo Base")
+    h_base = st.selectbox("Horizonte (meses) - Base", [1,6,12], key="base_h")
+    data_base = base_results[base_results["horizon"]==h_base]
+    st.line_chart(data_base.set_index("date")[["real_ibov","forecast_ibov"]], height=400)
 
-# Definição dos ranges de variação
-variacoes_dolar = [-0.50, -0.25, 0, 0.25, 0.50]  # Passos de 25 centavos
-variacoes_selic = [-1.0, -0.5, 0, 0.5, 1.0]      # Passos de 0.50%
+# ------------------------------
+# Tab 2 — Crises & Eleições
+# ------------------------------
+with tab2:
+    st.subheader("Performance em Subperíodos")
+    period = st.selectbox("Selecionar período", list(SUBPERIODS.keys()))
+    start,end = SUBPERIODS[period]
+    sub = data_base[(data_base["date"]>=start)&(data_base["date"]<=end)]
+    st.metric("RMSE", f"{rmse(sub.real_return, sub.forecast_return):.4f}")
+    st.metric("MAE", f"{mae(sub.real_return, sub.forecast_return):.4f}")
+    st.line_chart((sub.forecast_return - sub.real_return).cumsum(), height=300)
 
-# Criando a matriz de dados
-dados_matriz = []
-for v_selic in variacoes_selic:
-    linha = []
-    for v_dol in variacoes_dolar:
-        # Cálculo: Preço Base + (Impacto Juros) + (Impacto Câmbio)
-        # Assumindo Beta Câmbio médio de -8.000 pts por R$ 1,00 de variação
-        selic_simulada = focus['selic'] + v_selic
-        dolar_simulado = dolar_atual + v_dol
-        
-        impacto_juros = (13.75 - selic_simulada) * beta_selic
-        impacto_cambio = (dolar_atual - dolar_simulado) * 8000 # Beta Câmbio estimado
-        
-        preço_final = target_consenso + impacto_juros + impacto_cambio
-        linha.append(f"{preço_final/1000:.1f}k")
-    dados_matriz.append(linha)
+# ------------------------------
+# Tab 3 — Projeção do Usuário
+# ------------------------------
+with st.sidebar:
+    st.header("🧪 Projeção do Usuário")
+    user_h = st.selectbox("Horizonte", [1,6,12], key="user_h")
+    alpha = st.slider("α (Ridge)", 0.01, 50.0, 1.0)
+    window_type = st.radio("Janela", ["Expanding","Rolling"])
+    window_size = st.slider("Rolling window (meses)", 60,180,120)
+    selected_features = st.multiselect("Variáveis", ALL_FEATURES, default=ALL_FEATURES)
+    confidence = st.selectbox("Bandas de Confiança", [0.68,0.9,0.95], index=2)
+    run_user = st.button("Gerar Projeção do Usuário")
 
-# Criando o DataFrame para exibição
-df_sensibilidade = pd.DataFrame(
-    dados_matriz,
-    index=[f"Selic {focus['selic']+v}%" for v in variacoes_selic],
-    columns=[f"Dólar R${dolar_atual+v:.2f}" for v in variacoes_dolar]
-)
+with tab3:
+    if run_user:
+        macro_df = macro_data.copy()
+        results_user = backtest_ridge(
+            df=macro_df,
+            features=selected_features,
+            h=user_h,
+            alpha=alpha,
+            window_type=window_type,
+            window_size=window_size
+        )
+        results_user = add_confidence_band(results_user, confidence=confidence)
+        st.subheader("Resultado — Projeção do Usuário")
+        st.line_chart(results_user.set_index("date")[["forecast_ibov","upper","lower","real_ibov"]], height=400)
 
-# Exibição com estilo
-st.table(df_sensibilidade)
-
-st.caption("Valores em milhares de pontos (k). O cenário central (0,0) reflete as premissas atuais do Focus e do mercado.")
-
-# --- ESSA PARTE DEVE VIR ANTES ---
-st.sidebar.divider()
-st.sidebar.subheader("🎯 Seu Cenário Proprietário")
-
-# Criando as variáveis que deram erro
-user_pib = st.sidebar.number_input("PIB Alvo (%)", value=focus['pib'], step=0.10)
-user_dolar = st.sidebar.number_input("Dólar Alvo (R$)", value=dolar_atual, step=0.10)
-user_ipca = st.sidebar.number_input("Inflação Alvo (%)", value=focus['ipca'], step=0.10)
-user_selic = st.sidebar.number_input("Selic Alvo (%)", value=focus['selic'], step=0.25)
-user_brent = st.sidebar.number_input("Brent Alvo (US$)", value=float(current_prices['BZ=F']), step=1.0)
-
-# Cálculo da previsão (também antes do prompt)
-impacto_user = ((focus['selic'] - user_selic) * beta_selic) + ((user_brent - current_prices['BZ=F']) * beta_commodities)
-previsao_user = target_consenso + impacto_user
-
-# --- ESSA PARTE DEVE VIR DEPOIS ---
-st.divider()
-st.subheader("🤖 Gerador de Relatório para Gemini")
-
-prompt_text = f"""
-1. Dados de Mercado: Ibovespa {ibov_atual:,.0f} pts
-2. Meu Cenário: PIB {user_pib}%, Dólar R${user_dolar:.2f}, Selic {user_selic}%
-3. Previsão: {previsao_user:,.0f} pts
-"""
-st.text_area("Copie o texto abaixo:", value=prompt_text, height=200)
+# ------------------------------
+# Tab 4 — Comparação
+# ------------------------------
+with tab4:
+    st.subheader("Base vs Projeção do Usuário")
+    if run_user:
+        compare = data_base.merge(
+            results_user,
+            on="date",
+            suffixes=("_base","_user")
+        )
+        st.line_chart(compare.set_index("date")[["forecast_ibov_base","forecast_ibov_user","real_ibov_base"]], height=400)
