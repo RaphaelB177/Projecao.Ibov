@@ -4,7 +4,7 @@ import yfinance as yf
 import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
-from bcb import expect
+from bcb import Expectativas
 from datetime import datetime
 
 # Configuração da Página
@@ -15,7 +15,7 @@ st.set_page_config(page_title="Ibov 2026 Strategy", layout="wide")
 def get_focus_data():
     """Busca expectativas do Focus para 2026 via API do BCB"""
     try:
-        em = expect.get_endpoint('ExpectativasMercadoAnuais')
+        em = Expectativas.get_endpoint('ExpectativasMercadoAnuais')
         # Buscando Mediana para final de 2026
         df = em.query().filter(em.DataReferencia == '2026').collect()
         # Filtrando indicadores chave
@@ -114,3 +114,4 @@ with c2:
 
 
 st.info("Nota: Este dashboard utiliza regressão linear simples. Em anos eleitorais (2026), o prêmio de risco político pode causar desvios não capturados por modelos macroeconômicos puros.")
+
