@@ -155,3 +155,40 @@ st.table(df_sensibilidade)
 st.caption("Valores em milhares de pontos (k). O cenário central (0,0) reflete as premissas atuais do Focus e do mercado.")
 
 
+# --- GERADOR DE PROMPT AUTOMÁTICO ---
+st.divider()
+st.subheader("🤖 Gerador de Relatório para Gemini")
+st.markdown("Clique no botão abaixo para copiar o prompt estruturado com seus dados atuais.")
+
+# Construção do texto do Prompt
+prompt_text = f"""
+Atue como um estrategista-chefe de investimentos. Compare as expectativas de mercado com as minhas premissas proprietárias para gerar um relatório de sensibilidade.
+
+1. Dados de Mercado Atual (Referência):
+- Ibovespa: {ibov_atual:,.0f} pts
+- Dólar: R$ {dolar_atual:.2f}
+- Selic (Focus): {focus['selic']}%
+
+2. Meu Cenário Proprietário (Minhas Apostas):
+- PIB: {user_pib}% 
+- Dólar: R$ {user_dolar:.2f}
+- Inflação: {user_ipca}% 
+- Petróleo (Brent): US$ {user_brent:.2f}
+- SELIC: {user_selic}%
+
+3. Resultado do Modelo:
+- Com as minhas premissas, o Ibovespa calculado é de {previsao_user:,.0f} pontos.
+- O alvo do consenso de mercado (Target) é de {target_consenso:,.0f} pontos.
+
+Tarefa de Análise:
+1. Analise a distância entre a minha visão e a do mercado (Focus). Sou mais otimista ou pessimista?
+2. Qual dos meus inputs (PIB, Dólar ou Selic) foi o maior responsável pela variação do preço-alvo no meu cenário?
+3. Redija uma conclusão de um parágrafo defendendo por que um investidor deveria (ou não) acreditar no meu cenário em vez de seguir o consenso.
+"""
+
+# Botão de cópia rápida
+st.text_area("Copie o texto abaixo:", value=prompt_text, height=300)
+st.button("📋 Copiar para Área de Transferência", on_click=lambda: st.write("Texto copiado! (Use Ctrl+C)"))
+
+
+
