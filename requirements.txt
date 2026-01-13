@@ -5,4 +5,4 @@ yfinance
 pandas-datareader
 scikit-learn
 matplotlib
-python-bcdata
+python-bcb
