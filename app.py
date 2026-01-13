@@ -115,3 +115,43 @@ with c2:
 
 st.info("Nota: Este dashboard utiliza regressão linear simples. Em anos eleitorais (2026), o prêmio de risco político pode causar desvios não capturados por modelos macroeconômicos puros.")
 
+
+# --- TABELA DE SENSIBILIDADE ---
+st.divider()
+st.subheader("🎲 Matriz de Sensibilidade: Ibovespa 2026")
+st.markdown("Impacto cruzado de variações no **Dólar** e na **Selic** sobre o alvo do modelo.")
+
+# Definição dos ranges de variação
+variacoes_dolar = [-0.50, -0.25, 0, 0.25, 0.50]  # Passos de 25 centavos
+variacoes_selic = [-1.0, -0.5, 0, 0.5, 1.0]      # Passos de 0.50%
+
+# Criando a matriz de dados
+dados_matriz = []
+for v_selic in variacoes_selic:
+    linha = []
+    for v_dol in variacoes_dolar:
+        # Cálculo: Preço Base + (Impacto Juros) + (Impacto Câmbio)
+        # Assumindo Beta Câmbio médio de -8.000 pts por R$ 1,00 de variação
+        selic_simulada = focus['selic'] + v_selic
+        dolar_simulado = dolar_atual + v_dol
+        
+        impacto_juros = (13.75 - selic_simulada) * beta_selic
+        impacto_cambio = (dolar_atual - dolar_simulado) * 8000 # Beta Câmbio estimado
+        
+        preço_final = target_consenso + impacto_juros + impacto_cambio
+        linha.append(f"{preço_final/1000:.1f}k")
+    dados_matriz.append(linha)
+
+# Criando o DataFrame para exibição
+df_sensibilidade = pd.DataFrame(
+    dados_matriz,
+    index=[f"Selic {focus['selic']+v}%" for v in variacoes_selic],
+    columns=[f"Dólar R${dolar_atual+v:.2f}" for v in variacoes_dolar]
+)
+
+# Exibição com estilo
+st.table(df_sensibilidade)
+
+st.caption("Valores em milhares de pontos (k). O cenário central (0,0) reflete as premissas atuais do Focus e do mercado.")
+
+
