@@ -1,5 +1,3 @@
-﻿
-pip install streamlit yfinance python-bcb pandas plotly
 
 import streamlit as st
 import yfinance as yf
@@ -113,5 +111,6 @@ with c2:
     st.write("**Impacto de Commodities:**")
     brent_atual = current_prices['BZ=F']
     st.warning(f"O Brent a US$ {brent_atual:.2f} atua como suporte. Se houver quebra da barreira de US$ 90, o modelo sugere um acréscimo de {(90-brent_atual)*beta_commodities:,.0f} pontos via PETR4 e VALE3.")
+
 
 st.info("Nota: Este dashboard utiliza regressão linear simples. Em anos eleitorais (2026), o prêmio de risco político pode causar desvios não capturados por modelos macroeconômicos puros.")
