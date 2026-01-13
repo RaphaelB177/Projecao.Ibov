@@ -154,41 +154,28 @@ st.table(df_sensibilidade)
 
 st.caption("Valores em milhares de pontos (k). O cenário central (0,0) reflete as premissas atuais do Focus e do mercado.")
 
+# --- ESSA PARTE DEVE VIR ANTES ---
+st.sidebar.divider()
+st.sidebar.subheader("🎯 Seu Cenário Proprietário")
 
-# --- GERADOR DE PROMPT AUTOMÁTICO ---
+# Criando as variáveis que deram erro
+user_pib = st.sidebar.number_input("PIB Alvo (%)", value=focus['pib'], step=0.10)
+user_dolar = st.sidebar.number_input("Dólar Alvo (R$)", value=dolar_atual, step=0.10)
+user_ipca = st.sidebar.number_input("Inflação Alvo (%)", value=focus['ipca'], step=0.10)
+user_selic = st.sidebar.number_input("Selic Alvo (%)", value=focus['selic'], step=0.25)
+user_brent = st.sidebar.number_input("Brent Alvo (US$)", value=float(current_prices['BZ=F']), step=1.0)
+
+# Cálculo da previsão (também antes do prompt)
+impacto_user = ((focus['selic'] - user_selic) * beta_selic) + ((user_brent - current_prices['BZ=F']) * beta_commodities)
+previsao_user = target_consenso + impacto_user
+
+# --- ESSA PARTE DEVE VIR DEPOIS ---
 st.divider()
 st.subheader("🤖 Gerador de Relatório para Gemini")
-st.markdown("Clique no botão abaixo para copiar o prompt estruturado com seus dados atuais.")
 
-# Construção do texto do Prompt
 prompt_text = f"""
-Atue como um estrategista-chefe de investimentos. Compare as expectativas de mercado com as minhas premissas proprietárias para gerar um relatório de sensibilidade.
-
-1. Dados de Mercado Atual (Referência):
-- Ibovespa: {ibov_atual:,.0f} pts
-- Dólar: R$ {dolar_atual:.2f}
-- Selic (Focus): {focus['selic']}%
-
-2. Meu Cenário Proprietário (Minhas Apostas):
-- PIB: {user_pib}% 
-- Dólar: R$ {user_dolar:.2f}
-- Inflação: {user_ipca}% 
-- Petróleo (Brent): US$ {user_brent:.2f}
-- SELIC: {user_selic}%
-
-3. Resultado do Modelo:
-- Com as minhas premissas, o Ibovespa calculado é de {previsao_user:,.0f} pontos.
-- O alvo do consenso de mercado (Target) é de {target_consenso:,.0f} pontos.
-
-Tarefa de Análise:
-1. Analise a distância entre a minha visão e a do mercado (Focus). Sou mais otimista ou pessimista?
-2. Qual dos meus inputs (PIB, Dólar ou Selic) foi o maior responsável pela variação do preço-alvo no meu cenário?
-3. Redija uma conclusão de um parágrafo defendendo por que um investidor deveria (ou não) acreditar no meu cenário em vez de seguir o consenso.
+1. Dados de Mercado: Ibovespa {ibov_atual:,.0f} pts
+2. Meu Cenário: PIB {user_pib}%, Dólar R${user_dolar:.2f}, Selic {user_selic}%
+3. Previsão: {previsao_user:,.0f} pts
 """
-
-# Botão de cópia rápida
-st.text_area("Copie o texto abaixo:", value=prompt_text, height=300)
-st.button("📋 Copiar para Área de Transferência", on_click=lambda: st.write("Texto copiado! (Use Ctrl+C)"))
-
-
-
+st.text_area("Copie o texto abaixo:", value=prompt_text, height=200)
