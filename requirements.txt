@@ -2,7 +2,6 @@ streamlit
 pandas
 numpy
 yfinance
-pandas-datareader
 scikit-learn
 matplotlib
 python-bcb
