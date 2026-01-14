@@ -10,78 +10,82 @@ import time
 
 st.set_page_config(layout="wide", page_title="Ibov Projeção Macro")
 
-# --- Função de Download com Retry para contornar Rate Limit ---
-def download_yf_with_retry(ticker, start_date, retries=3):
+# --- BOTÃO DE REFRESH NO TOPO DA SIDEBAR ---
+if st.sidebar.button("🔄 Atualizar Dados das APIs"):
+    st.cache_data.clear() # Limpa o cache, forçando o download na próxima execução
+    st.rerun()
+
+# --- Função de Download com Retry ---
+def download_yf_with_retry(ticker, start_date, retries=2):
     for i in range(retries):
         try:
             data = yf.download(ticker, start=start_date, progress=False)
             if not data.empty:
-                # Ajuste para garantir que pegamos a coluna correta em multi-index ou single
                 if isinstance(data.columns, pd.MultiIndex):
                     return data['Adj Close'][ticker]
                 return data['Adj Close']
-        except Exception:
-            time.sleep(2) # Espera 2 segundos antes de tentar de novo
+        except:
+            time.sleep(1)
     return pd.Series()
 
-# --- Função para baixar FRED via CSV direto ---
+# --- Função para baixar FRED ---
 def get_fred_data(series_code, start_date):
     url = f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={series_code}"
     try:
-        df_fred = pd.read_csv(url, index_col='DATE', parse_dates=True)
-        return df_fred[df_fred.index >= start_date]
+        return pd.read_csv(url, index_col='DATE', parse_dates=True)
     except:
         return pd.DataFrame()
 
 # -------------------
-# Carregamento de Dados
+# Carregamento de Dados COM CACHE LONGO
 # -------------------
-@st.cache_data(ttl=3600)
+@st.cache_data(ttl=None) # TTL=None faz com que os dados nunca expirem sozinhos
 def load_data():
     start_date = "2010-01-01"
     
-    # 1. Ibovespa (Yahoo) - Com Retry
-    ibov = download_yf_with_retry("^BVSP", start_date)
-    if ibov.empty:
-        st.error("O Yahoo Finance bloqueou a requisição temporariamente (Rate Limit). Tente atualizar a página em alguns instantes.")
-        st.stop()
-    ibov = ibov.resample('ME').last()
+    # Aviso visual de que o app está buscando dados reais
+    with st.spinner("Buscando novos dados das APIs (Yahoo, BCB, FRED)..."):
+        # 1. Ibovespa
+        ibov = download_yf_with_retry("^BVSP", start_date)
+        if ibov.empty:
+            st.error("Erro no Yahoo Finance. Tente o Refresh novamente em instantes.")
+            st.stop()
+        ibov = ibov.resample('ME').last()
 
-    # 2. Dados via Banco Central (BCB/SGS) - Mais estável que o Yahoo
-    # 1: Dólar Venda, 433: IPCA, 4390: SELIC, 438: PIB
-    try:
-        dict_sgs = {
-            'dolar': 1,
-            'inflacao': 433,
-            'juros_brasil': 4390,
-            'pib': 438
-        }
-        df_sgs = sgs.get(dict_sgs, start=start_date)
-    except Exception as e:
-        st.error(f"Erro ao conectar com o Banco Central: {e}")
-        st.stop()
+        # 2. Dados via Banco Central (SGS)
+        try:
+            dict_sgs = {'dolar': 1, 'inflacao': 433, 'juros_brasil': 4390, 'pib': 438}
+            df_sgs = sgs.get(dict_sgs, start=start_date)
+        except:
+            st.error("Erro no Banco Central.")
+            st.stop()
 
-    # 3. Juros USA via FRED
-    juros_usa = get_fred_data('FEDFUNDS', start_date)
-    juros_usa.columns = ['juros_americano']
+        # 3. Juros USA
+        juros_usa = get_fred_data('FEDFUNDS', start_date)
+        juros_usa.columns = ['juros_americano']
 
-    # Consolidação
-    main_df = pd.DataFrame(index=ibov.index)
-    main_df['ibov'] = ibov
-    
-    for d in [df_sgs, juros_usa]:
-        d.index = pd.to_datetime(d.index)
-        main_df = main_df.join(d.resample('ME').last(), how='left')
+        # Consolidação
+        main_df = pd.DataFrame(index=ibov.index)
+        main_df['ibov'] = ibov
+        for d in [df_sgs, juros_usa]:
+            d.index = pd.to_datetime(d.index)
+            main_df = main_df.join(d.resample('ME').last(), how='left')
 
-    main_df = main_df.ffill().dropna()
-    main_df['target_ret'] = main_df['ibov'].pct_change().shift(-1)
-    return main_df.dropna()
+        main_df = main_df.ffill().dropna()
+        main_df['target_ret'] = main_df['ibov'].pct_change().shift(-1)
+        return main_df.dropna()
 
+# Chama a função de dados
 df = load_data()
 
-# --- Restante do Modelo (Ridge, Scaler, Plots) permanece igual ---
+# -------------------
+# Interface e Modelo
+# -------------------
 st.title("📈 Projeção Ibovespa (Ex-Ante)")
-st.write(f"Dados atualizados até: {df.index[-1].strftime('%d/%m/%Y')}")
+st.info(f"Dados em cache desde o último refresh. Última data disponível: {df.index[-1].strftime('%d/%m/%Y')}")
+
+# O restante do seu código de modelo e gráficos continua aqui...
+# [Ridge Regression, Scaler, Inputs do Usuário e Plots]
 
 features = ["juros_brasil", "dolar", "pib", "inflacao", "juros_americano"]
 X = df[features]
@@ -89,36 +93,25 @@ y = df["target_ret"]
 
 scaler = StandardScaler()
 X_scaled = scaler.fit_transform(X)
-
 model = Ridge(alpha=1.0).fit(X_scaled, y)
 
-# Sidebar amigável
-st.sidebar.header("Configure o Cenário")
-input_map = {
-    "juros_brasil": "Selic Brasil (%)",
-    "dolar": "Câmbio (R$)",
-    "pib": "Crescimento PIB (%)",
-    "inflacao": "IPCA (%)",
-    "juros_americano": "Juros EUA (%)"
-}
-
+# Sidebar para inputs
+st.sidebar.divider()
+st.sidebar.header("Cenário de Projeção")
 user_vals = []
-for f in features:
-    val = st.sidebar.number_input(input_map[f], value=float(df[f].iloc[-1]), format="%.2f")
+input_names = ["Selic (%)", "Dólar (R$)", "PIB (%)", "IPCA (%)", "Juros EUA (%)"]
+for i, f in enumerate(features):
+    val = st.sidebar.number_input(input_names[i], value=float(df[f].iloc[-1]))
     user_vals.append(val)
 
-# Predição
-user_scaled = scaler.transform([user_vals])
-pred_ret = model.predict(user_scaled)[0]
+# Predição e Plots
+pred_ret = model.predict(scaler.transform([user_vals]))[0]
 
 c1, c2 = st.columns(2)
 with c1:
     st.metric("Projeção Retorno (Próximo Mês)", f"{pred_ret:.2%}")
     st.metric("Ibov Alvo", f"{df['ibov'].iloc[-1] * (1+pred_ret):,.0f}")
-
 with c2:
-    st.subheader("Peso das Variáveis")
     fig, ax = plt.subplots()
-    colors = ['red' if x < 0 else 'green' for x in model.coef_]
-    pd.Series(model.coef_, index=[input_map[f] for f in features]).plot(kind='barh', ax=ax, color=colors)
+    pd.Series(model.coef_, index=input_names).plot(kind='barh', ax=ax, color='teal')
     st.pyplot(fig)
