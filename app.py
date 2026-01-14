@@ -9,75 +9,72 @@ import matplotlib.pyplot as plt
 from datetime import datetime, timedelta
 import time
 
-# Configurações iniciais
 st.set_page_config(layout="wide", page_title="Ibov Projeção Macro", page_icon="📈")
 
-# --- LÓGICA DE REFRESH MANUAL ---
-st.sidebar.title("Configurações")
+# --- BOTÃO DE REFRESH ---
 if st.sidebar.button("🔄 Forçar Atualização (API Refresh)"):
     st.cache_data.clear()
     st.rerun()
 
-# --- FUNÇÃO DE DOWNLOAD ROBUSTA ---
+# --- DOWNLOAD YFINANCE (TRATAMENTO DE ERRO) ---
 def download_yf_safe(ticker, start_date):
     try:
         data = yf.download(ticker, start=start_date, progress=False)
-        if data.empty:
-            return pd.Series()
-
+        if data.empty: return pd.Series()
         if isinstance(data.columns, pd.MultiIndex):
-            if 'Adj Close' in data.columns.get_level_values(0):
-                return data['Adj Close'][ticker]
-            if 'Close' in data.columns.get_level_values(0):
-                return data['Close'][ticker]
-        else:
-            if 'Adj Close' in data.columns:
-                return data['Adj Close']
-            if 'Close' in data.columns:
-                return data['Close']
-        return pd.Series()
-    except Exception as e:
-        st.error(f"❌ Erro no Yahoo Finance ({ticker}): {str(e)}")
+            col = 'Adj Close' if 'Adj Close' in data.columns.get_level_values(0) else 'Close'
+            return data[col][ticker]
+        return data['Adj Close'] if 'Adj Close' in data.columns else data['Close']
+    except:
         return pd.Series()
 
-# --- FUNÇÃO FRED VIA CSV ---
-def get_fred_data(series_code, start_date):
+# --- DOWNLOAD SGS/BCB (TRATAMENTO DE ERRO "EXPECTED OBJECT") ---
+def get_sgs_safe(dict_series, start_date):
+    try:
+        # Tenta a conexão oficial
+        df = sgs.get(dict_series, start=start_date)
+        return df
+    except Exception as e:
+        st.error(f"⚠️ O Banco Central (SGS) está instável ou em manutenção. Detalhe: {str(e)}")
+        # Retorna DataFrame vazio para não quebrar o join
+        return pd.DataFrame()
+
+# --- DOWNLOAD FRED (VIA URL DIRETA) ---
+def get_fred_safe(series_code, start_date):
     url = f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={series_code}"
     try:
-        df_fred = pd.read_csv(url, index_col='DATE', parse_dates=True)
-        return df_fred[df_fred.index >= pd.to_datetime(start_date)]
+        df = pd.read_csv(url, index_col='DATE', parse_dates=True)
+        return df[df.index >= pd.to_datetime(start_date)]
     except:
         return pd.DataFrame()
 
 # -------------------
-# CARREGAMENTO COM CACHE (Limite de 10 anos)
+# CARREGAMENTO COM CACHE E FALLBACK
 # -------------------
 @st.cache_data(ttl=None)
 def load_data():
-    # AJUSTE: O BCB limita séries diárias a 10 anos. 
-    # Calculamos 10 anos atrás a partir de hoje (ex: 2026 -> 2016)
+    # Limite de 10 anos para evitar erro do BCB
     dez_anos_atras = datetime.now() - timedelta(days=365*10)
     start_date = dez_anos_atras.strftime('%Y-%m-%d')
     
-    with st.spinner(f"📦 Sincronizando dados desde {dez_anos_atras.year} (Limite de 10 anos)..."):
+    with st.spinner("Conectando às APIs (pode levar alguns segundos)..."):
         # 1. Ibovespa
         ibov = download_yf_safe("^BVSP", start_date)
         if ibov.empty:
-            st.info("Aguardando liberação do Yahoo Finance (Rate Limit).")
+            st.warning("⚠️ Yahoo Finance não respondeu. Usando dados históricos em cache (se houver).")
             st.stop()
         ibov = ibov.resample('ME').last()
 
-        # 2. Dados via Banco Central (SGS)
-        try:
-            # 1: Dólar (Diária), 433: IPCA (Mensal), 4390: SELIC (Mensal), 438: PIB (Trimestral)
-            dict_sgs = {'dolar': 1, 'inflacao': 433, 'juros_brasil': 4390, 'pib': 438}
-            df_sgs = sgs.get(dict_sgs, start=start_date)
-        except Exception as e:
-            st.error(f"❌ Erro na API do Banco Central: {str(e)}")
+        # 2. Banco Central (SGS) - Captura o erro "Expected object" aqui
+        dict_sgs = {'dolar': 1, 'inflacao': 433, 'juros_brasil': 4390, 'pib': 438}
+        df_sgs = get_sgs_safe(dict_sgs, start_date)
+        
+        if df_sgs.empty:
+            st.info("💡 Dica: O sistema do Banco Central costuma oscilar fora do horário comercial ou em picos de acesso.")
             st.stop()
 
-        # 3. Juros Americanos (FRED)
-        juros_usa = get_fred_data('FEDFUNDS', start_date)
+        # 3. FRED
+        juros_usa = get_fred_safe('FEDFUNDS', start_date)
         juros_usa.columns = ['juros_americano']
 
         # Consolidação
@@ -85,21 +82,21 @@ def load_data():
         main_df['ibov'] = ibov
         
         for d in [df_sgs, juros_usa]:
-            d.index = pd.to_datetime(d.index)
-            main_df = main_df.join(d.resample('ME').last(), how='left')
+            if not d.empty:
+                d.index = pd.to_datetime(d.index)
+                main_df = main_df.join(d.resample('ME').last(), how='left')
 
         main_df = main_df.ffill().dropna()
         main_df['target_ret'] = main_df['ibov'].pct_change().shift(-1)
-        
         return main_df.dropna()
 
 df = load_data()
 
 # -------------------
-# MODELAGEM E DASHBOARD (Mantido)
+# MODELO E UI (DASHBOARD)
 # -------------------
 st.title("📈 Projeção Ex-Ante Ibovespa")
-st.markdown(f"**Janela de Dados:** {df.index[0].strftime('%m/%Y')} até {df.index[-1].strftime('%m/%Y')} (Máx 10 anos)")
+st.markdown(f"**Base de dados:** {df.index[0].strftime('%Y')} a {df.index[-1].strftime('%Y')}")
 
 features = ["juros_brasil", "dolar", "pib", "inflacao", "juros_americano"]
 X = df[features]
@@ -109,37 +106,34 @@ scaler = StandardScaler()
 X_scaled = scaler.fit_transform(X)
 model = Ridge(alpha=1.0).fit(X_scaled, y)
 
-# Sidebar
+# Sidebar Simulação
 st.sidebar.divider()
-st.sidebar.subheader("Cenário para Próximo Mês")
+st.sidebar.subheader("Cenário Futuro")
 user_inputs = []
-friendly_names = ["Selic Brasil (%)", "Dólar (R$)", "PIB (Var %)", "IPCA (%)", "Fed Funds (%)"]
-
+labels = ["Selic (%)", "Dólar (R$)", "PIB (%)", "IPCA (%)", "Juros EUA (%)"]
 for i, f in enumerate(features):
-    val = st.sidebar.number_input(friendly_names[i], value=float(df[f].iloc[-1]), format="%.2f")
+    val = st.sidebar.number_input(labels[i], value=float(df[f].iloc[-1]), format="%.2f")
     user_inputs.append(val)
 
-# Resultados
-pred_retorno = model.predict(scaler.transform([user_inputs]))[0]
+# Predição
+pred_ret = model.predict(scaler.transform([user_inputs]))[0]
 
 c1, c2, c3 = st.columns(3)
 with c1:
-    st.metric("Projeção Retorno (1M)", f"{pred_retorno:.2%}")
+    st.metric("Projeção Retorno (M+1)", f"{pred_ret:.2%}")
 with c2:
-    st.metric("Ibovespa Alvo", f"{df['ibov'].iloc[-1] * (1 + pred_retorno):,.0f}")
+    st.metric("Ibov Alvo", f"{df['ibov'].iloc[-1] * (1 + pred_ret):,.0f}")
 with c3:
     st.metric("Aderência (R²)", f"{model.score(X_scaled, y):.2f}")
 
+# Gráficos
 st.divider()
-col_left, col_right = st.columns(2)
-with col_left:
-    st.subheader("🎯 Importância das Variáveis")
-    fig_imp, ax_imp = plt.subplots(figsize=(10, 6))
-    pd.Series(model.coef_, index=friendly_names).sort_values().plot(
-        kind='barh', color=['#ff4b4b' if x < 0 else '#00cc96' for x in sorted(model.coef_)], ax=ax_imp
-    )
-    st.pyplot(fig_imp)
-
-with col_right:
-    st.subheader("📊 Histórico Ibovespa (10 anos)")
+col_l, col_r = st.columns(2)
+with col_l:
+    st.subheader("🎯 Pesos do Modelo")
+    fig, ax = plt.subplots()
+    pd.Series(model.coef_, index=labels).sort_values().plot(kind='barh', color='teal', ax=ax)
+    st.pyplot(fig)
+with col_r:
+    st.subheader("📊 Evolução Ibovespa")
     st.line_chart(df['ibov'])
