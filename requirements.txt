@@ -5,3 +5,5 @@ yfinance
 scikit-learn
 matplotlib
 requests
+seaborn
+
