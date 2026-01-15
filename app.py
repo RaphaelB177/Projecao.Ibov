@@ -12,20 +12,18 @@ import io
 import requests
 
 # -------------------
-# Configurações e Coleta
+# Configurações Iniciais
 # -------------------
-st.set_page_config(layout="wide", page_title="Ibov Intelligence Dashboard", page_icon="📊")
+st.set_page_config(layout="wide", page_title="Dashboard Macro Ibovespa", page_icon="📊")
 
 @st.cache_data(ttl=None)
-def load_data_v4():
+def load_data_v5():
     hoje = datetime.now() - timedelta(days=2)
     start_str = (hoje - timedelta(days=365*12)).strftime('%Y-%m-%d')
     
-    # 1. Ibov (Tratamento Multi-index robusto)
+    # 1. Ibovespa (Tratamento Multi-index)
     try:
         ibov_raw = yf.download("^BVSP", start=start_str, progress=False)
-        if ibov_raw.empty: st.stop()
-        
         if isinstance(ibov_raw.columns, pd.MultiIndex):
             nivel_0 = ibov_raw.columns.get_level_values(0)
             col = 'Adj Close' if 'Adj Close' in nivel_0 else 'Close'
@@ -35,7 +33,7 @@ def load_data_v4():
             ibov = ibov_raw[col]
         df = ibov.resample('ME').last().to_frame('ibov')
     except:
-        st.error("Erro ao carregar dados do Yahoo Finance.")
+        st.error("Erro ao carregar Yahoo Finance.")
         st.stop()
 
     # 2. Função SGS Segura
@@ -46,14 +44,13 @@ def load_data_v4():
             d = pd.read_csv(io.StringIO(r.text), sep=';', decimal=',')
             d['data'] = pd.to_datetime(d['data'], dayfirst=True)
             d = d.rename(columns={'valor': nome}).set_index('data')
-            return d.resample('ME').last() if not d.empty else pd.DataFrame()
+            return d.resample('ME').last()
         except: return pd.DataFrame()
 
-    # Join Macro (Somente se houver dados)
+    # Join das Séries
     for cod, nome in [(1, 'dolar'), (433, 'inflacao'), (4390, 'juros_brasil'), (438, 'pib')]:
         m_data = get_sgs_safe(cod, nome)
-        if not m_data.empty: 
-            df = df.join(m_data, how='left')
+        if not m_data.empty: df = df.join(m_data, how='left')
     
     df = df.ffill().dropna()
     df['ret_1m'] = df['ibov'].pct_change(1).shift(-1)
@@ -61,127 +58,105 @@ def load_data_v4():
     df['ret_12m'] = df['ibov'].pct_change(12).shift(-12)
     return df
 
-df_full = load_data_v4()
+df_full = load_data_v5()
 
 # -------------------
 # Interface Principal
 # -------------------
-st.title("📊 Ibovespa: Inteligência Macro e Sensibilidade")
+st.title("📊 Inteligência Estatística Ibovespa")
 
-# Sidebar - Detecção Automática de Features Presentes
+# Identificar colunas presentes para evitar KeyError
 features_all = ["juros_brasil", "dolar", "pib", "inflacao"]
 features_presentes = [f for f in features_all if f in df_full.columns]
 
-if not features_presentes:
-    st.error("Nenhum dado macroeconômico foi carregado. Verifique a conexão com o Banco Central.")
-    st.stop()
-
-st.sidebar.header("Cenário e Modelo")
-window_type = st.sidebar.selectbox("Janela Backtest:", ["Expanding", "Rolling"])
-rolling_size = st.sidebar.slider("Janela Móvel", 12, 60, 36)
-
+st.sidebar.header("Cenário de Projeção")
 u_inputs = []
 for f in features_presentes:
-    # Verificação de segurança para evitar o KeyError
-    ultimo_valor = float(df_full[f].iloc[-1])
-    val = st.sidebar.number_input(f"Expectativa {f}", value=ultimo_valor, step=0.01)
+    val = st.sidebar.number_input(f"Expectativa {f}", value=float(df_full[f].iloc[-1]), step=0.01)
     u_inputs.append(val)
 
-# -------------------
-# 1. Mapa de Calor (Heatmap)
-# -------------------
-
-st.header("1. Força dos Indicadores (Correlação)")
+# 1. Mapa de Calor de Correlação
+st.header("1. Mapa de Calor (Correlação Macro)")
 corr_cols = features_presentes + ['ret_1m', 'ret_6m', 'ret_12m']
-corr_matrix = df_full[corr_cols].corr()
-corr_target = corr_matrix.loc[features_presentes, ['ret_1m', 'ret_6m', 'ret_12m']]
+corr_matrix = df_full[corr_cols].corr().loc[features_presentes, ['ret_1m', 'ret_6m', 'ret_12m']]
 
-fig_corr, ax_corr = plt.subplots(figsize=(10, 4))
-sns.heatmap(corr_target.T, annot=True, cmap="RdYlGn", center=0, ax=ax_corr)
-ax_corr.set_title("Correlação: Indicador Hoje vs Retorno Futuro")
+
+fig_corr, ax_corr = plt.subplots(figsize=(12, 3.5))
+sns.heatmap(corr_matrix.T, annot=True, cmap="RdYlGn", center=0, ax=ax_corr, fmt=".2f")
 st.pyplot(fig_corr)
 
-# -------------------
 # 2. Projeções e Backtest
-# -------------------
 st.header("2. Projeções por Horizonte")
 horizontes = {"1 Mês": "ret_1m", "6 Meses": "ret_6m", "12 Meses": "ret_12m"}
 modelos_treinados = {}
 
 tabs = st.tabs(list(horizontes.keys()))
-
 for i, (label, col_target) in enumerate(horizontes.items()):
     with tabs[i]:
         df_h = df_full.dropna(subset=[col_target])
-        if len(df_h) < 48:
-            st.warning(f"Histórico insuficiente para {label}.")
-            continue
-            
         X, y = df_h[features_presentes], df_h[col_target]
         scaler = StandardScaler()
         X_s = scaler.fit_transform(X)
         
-        # Backtest
-        start_idx = 48
-        preds_bt, actuals_bt = [], []
-        for j in range(start_idx, len(y)):
-            X_t = X_s[:j] if window_type == "Expanding" else X_s[max(0, j-rolling_size):j]
-            y_t = y[:j] if window_type == "Expanding" else y[max(0, j-rolling_size):j]
-            mdl = Ridge(alpha=0.5).fit(X_t, y_t)
-            preds_bt.append(mdl.predict(X_s[j:j+1])[0])
-            actuals_bt.append(y.iloc[j])
-        
-        res_bt = pd.DataFrame({"Real": actuals_bt, "Prev": preds_bt}, index=y.index[start_idx:])
-        
-        # Modelo Final para Projeção
-        mdl_f = Ridge(alpha=0.5).fit(X_s, y)
-        modelos_treinados[label] = (mdl_f, scaler)
-        pred_u = mdl_f.predict(scaler.transform([u_inputs]))[0]
+        # Modelo Final
+        mdl = Ridge(alpha=0.5).fit(X_s, y)
+        modelos_treinados[label] = (mdl, scaler)
+        pred = mdl.predict(scaler.transform([u_inputs]))[0]
         
         c1, c2 = st.columns([2, 1])
         with c1:
-            fig_h, ax_h = plt.subplots(figsize=(10, 4))
-            ax_h.plot(res_bt["Real"].cumsum(), label="Real", color="black", alpha=0.7)
-            ax_h.plot(res_bt["Prev"].cumsum(), label="Previsto", color="#1f77b4", ls="--")
-            ax_h.set_title(f"Performance Acumulada - {label}")
-            ax_h.legend()
-            st.pyplot(fig_h)
+            # Backtest histórico simplificado
+            preds_bt = []
+            for j in range(48, len(y)):
+                m_bt = Ridge(alpha=0.5).fit(X_s[:j], y[:j])
+                preds_bt.append(m_bt.predict(X_s[j:j+1])[0])
+            res_bt = pd.Series(preds_bt, index=y.index[48:])
+            
+            fig_bt, ax_bt = plt.subplots(figsize=(10, 4))
+            ax_bt.plot(y[48:].cumsum(), label="Real", color="black", alpha=0.6)
+            ax_bt.plot(res_bt.cumsum(), label="Modelo", color="#1f77b4", ls="--")
+            ax_bt.legend()
+            st.pyplot(fig_bt)
         with c2:
-            st.metric("Retorno Projetado", f"{pred_u:.2%}")
-            st.metric("Ibov Alvo", f"{df_full['ibov'].iloc[-1]*(1+pred_u):,.0f}")
-            rmse = np.sqrt(mean_squared_error(res_bt["Real"], res_bt["Prev"]))
-            st.caption(f"RMSE Histórico: {rmse:.4f}")
+            st.metric("Retorno Projetado", f"{pred:.2%}")
+            st.metric("Alvo Estimado", f"{df_full['ibov'].iloc[-1]*(1+pred):,.0f}")
 
-# -------------------
-# 3. Tabela de Sensibilidade
-# -------------------
-
+# 3. Tabela de Sensibilidade (Garantida)
 st.divider()
-if "juros_brasil" in features_presentes and "dolar" in features_presentes:
-    st.header("3. Análise de Sensibilidade (Stress Test)")
-    st.write("Matriz de Retorno Projetado (1 Mês) variando Juros e Dólar:")
+st.header("3. Tabela de Sensibilidade (Stress Test)")
+st.write("Variação do Retorno Projetado (1 Mês) ao cruzar Juros e Dólar:")
 
+if "juros_brasil" in features_presentes and "dolar" in features_presentes:
     j_idx = features_presentes.index("juros_brasil")
     d_idx = features_presentes.index("dolar")
-
-    # Gerar ranges (+/- 10%)
-    j_range = np.linspace(u_inputs[j_idx]*0.9, u_inputs[j_idx]*1.1, 5)
-    d_range = np.linspace(u_inputs[d_idx]*0.9, u_inputs[d_idx]*1.1, 5)
-
-    sens_matrix = np.zeros((5, 5))
+    
+    # Criar eixos (Var de +/- 10% do valor de input)
+    j_vals = np.linspace(u_inputs[j_idx]*0.8, u_inputs[j_idx]*1.2, 7)
+    d_vals = np.linspace(u_inputs[d_idx]*0.8, u_inputs[d_idx]*1.2, 7)
+    
+    sens_data = []
     mdl_s, scaler_s = modelos_treinados["1 Mês"]
-
-    for i, j_val in enumerate(j_range):
-        for j, d_val in enumerate(d_range):
-            scenario = list(u_inputs)
-            scenario[j_idx] = j_val
-            scenario[d_idx] = d_val
-            sens_matrix[i, j] = mdl_s.predict(scaler_s.transform([scenario]))[0]
-
+    
+    for j_val in j_vals:
+        linha = []
+        for d_val in d_vals:
+            scen = list(u_inputs)
+            scen[j_idx], scen[d_idx] = j_val, d_val
+            linha.append(mdl_s.predict(scaler_s.transform([scen]))[0])
+        sens_data.append(linha)
+    
     df_sens = pd.DataFrame(
-        sens_matrix, 
-        index=[f"Selic {x:.2f}%" for x in j_range],
-        columns=[f"Dólar R${x:.2f}" for x in d_range]
+        sens_data, 
+        index=[f"Selic {x:.2f}%" for x in j_vals],
+        columns=[f"Dólar R${x:.2f}" for x in d_vals]
     )
 
-    st.dataframe(df_sens.style.format("{:.2%}").background_gradient(cmap="RdYlGn", axis=None))
+    
+    st.dataframe(df_sens.style.format("{:.2%}")
+                 .background_gradient(cmap="RdYlGn", axis=None))
+else:
+    st.warning("Variáveis 'juros_brasil' ou 'dolar' não encontradas para gerar a tabela de sensibilidade.")
+
+# Footer técnico
+with st.expander("Base de Dados Bruta"):
+    st.write(df_full.tail(10))
