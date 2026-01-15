@@ -13,18 +13,41 @@ import requests
 # -------------------
 # Configurações e Coleta
 # -------------------
-st.set_page_config(layout="wide", page_title="Ibov Projeção Multi-Horizonte")
+st.set_page_config(layout="wide", page_title="Ibov Projeção Multi-Horizonte", page_icon="📈")
 
 @st.cache_data(ttl=None)
 def load_data_v3():
     hoje = datetime.now() - timedelta(days=2)
-    start_str = (hoje - timedelta(days=365*12)).strftime('%Y-%m-%d') # 12 anos para sobrar dados
+    # Janela de 12 anos para garantir dados suficientes para o alvo de 12m
+    start_str = (hoje - timedelta(days=365*12)).strftime('%Y-%m-%d')
     
-    # Ibov real (SGS para Dólar e Macro para evitar Rate Limit)
+    # 1. Ibov com tratamento robusto de colunas
     ibov_raw = yf.download("^BVSP", start=start_str, progress=False)
-    ibov = ibov_raw['Adj Close'].iloc[:,0] if isinstance(ibov_raw.columns, pd.MultiIndex) else ibov_raw['Adj Close']
+    
+    if ibov_raw.empty:
+        st.error("Erro: Yahoo Finance não retornou dados para ^BVSP.")
+        st.stop()
+
+    # Tratamento flexível de colunas (Adj Close ou Close)
+    if isinstance(ibov_raw.columns, pd.MultiIndex):
+        cols_nivel_0 = ibov_raw.columns.get_level_values(0)
+        if 'Adj Close' in cols_nivel_0:
+            ibov = ibov_raw['Adj Close'].iloc[:, 0]
+        elif 'Close' in cols_nivel_0:
+            ibov = ibov_raw['Close'].iloc[:, 0]
+        else:
+            ibov = ibov_raw.iloc[:, 0] # Pega a primeira coluna disponível
+    else:
+        if 'Adj Close' in ibov_raw.columns:
+            ibov = ibov_raw['Adj Close']
+        elif 'Close' in ibov_raw.columns:
+            ibov = ibov_raw['Close']
+        else:
+            ibov = ibov_raw.iloc[:, 0]
+
     df = ibov.resample('ME').last().to_frame('ibov')
 
+    # 2. Funções SGS (CSV Direto)
     def get_sgs(codigo, nome):
         url = f"https://api.bcb.gov.br/dados/serie/bcdata.sgs.{codigo}/dados?formato=csv"
         try:
@@ -34,6 +57,7 @@ def load_data_v3():
             return d.rename(columns={'valor': nome}).set_index('data')
         except: return pd.DataFrame()
 
+    # Join das variáveis macro
     df = df.join(get_sgs(1, 'dolar').resample('ME').last(), how='left')
     df = df.join(get_sgs(433, 'inflacao').resample('ME').last(), how='left')
     df = df.join(get_sgs(4390, 'juros_brasil').resample('ME').last(), how='left')
@@ -46,7 +70,7 @@ def load_data_v3():
     df['ret_6m'] = df['ibov'].pct_change(6).shift(-6)
     df['ret_12m'] = df['ibov'].pct_change(12).shift(-12)
     
-    return df.dropna(subset=['ret_1m']) # Remove apenas o último sem alvo de 1m
+    return df
 
 df_full = load_data_v3()
 
@@ -65,10 +89,10 @@ X_raw = df_full[features]
 
 # Inputs do Usuário para Projeção
 st.sidebar.header("Cenário de Projeção")
-u_inputs = [st.sidebar.number_input(f, value=float(X_raw[f].iloc[-1])) for f in features]
+u_inputs = [st.sidebar.number_input(f"Expectativa para {f}", value=float(X_raw[f].iloc[-1])) for f in features]
 
 # -------------------
-# Loop de Horizontes (Lógica Original Recuperada)
+# Loop de Horizontes
 # -------------------
 horizontes = {"1 Mês": "ret_1m", "6 Meses": "ret_6m", "12 Meses": "ret_12m"}
 alphas = {"1 Mês": 0.5, "6 Meses": 0.5, "12 Meses": 1.0}
@@ -77,15 +101,20 @@ tabs = st.tabs(list(horizontes.keys()))
 
 for i, (label, col_target) in enumerate(horizontes.items()):
     with tabs[i]:
-        # Preparação dos dados específicos para o horizonte (removendo NaNs do shift)
+        # Filtra apenas linhas onde o alvo existe (remove os nulos do shift no final)
         df_h = df_full.dropna(subset=[col_target])
+        
+        if len(df_h) < 60:
+            st.warning(f"Dados insuficientes para o horizonte {label}.")
+            continue
+
         X = df_h[features]
         y = df_h[col_target]
         
         scaler = StandardScaler()
         X_s = scaler.fit_transform(X)
         
-        # Função de Backtest simplificada para performance
+        # Backtest (Lógica original)
         start_idx = 48
         preds_bt = []
         actuals_bt = []
@@ -98,10 +127,10 @@ for i, (label, col_target) in enumerate(horizontes.items()):
             preds_bt.append(mdl.predict(X_s[j:j+1])[0])
             actuals_bt.append(y.iloc[j])
         
-        # Métricas e Gráfico de Backtest
         res_bt = pd.DataFrame({"Real": actuals_bt, "Prev": preds_bt}, index=y.index[start_idx:])
         rmse = np.sqrt(mean_squared_error(res_bt["Real"], res_bt["Prev"]))
         
+        # Dashboard do Horizonte
         c1, c2 = st.columns([2, 1])
         with c1:
             fig, ax = plt.subplots(figsize=(10, 4))
@@ -113,7 +142,7 @@ for i, (label, col_target) in enumerate(horizontes.items()):
         
         with c2:
             st.metric(f"RMSE ({label})", f"{rmse:.4f}")
-            # Projeção Real-Time para este horizonte
+            # Projeção Real-Time
             mdl_final = Ridge(alpha=alphas[label]).fit(X_s, y)
             u_scaled = scaler.transform([u_inputs])
             pred_u = mdl_final.predict(u_scaled)[0]
@@ -122,9 +151,9 @@ for i, (label, col_target) in enumerate(horizontes.items()):
             st.write(f"Retorno esperado: **{pred_u:.2%}**")
             st.write(f"Preço alvo: **{df_full['ibov'].iloc[-1]*(1+pred_u):,.0f}**")
             
-            # Cálculo de Intervalo de Confiança (Original)
             std_resid = (res_bt["Real"] - res_bt["Prev"]).std()
             st.caption(f"Margem de Erro (95%): ±{1.96*std_resid:.2%}")
 
 st.divider()
-st.info("Nota: O modelo treina o retorno acumulado. Para 12 meses, ele tenta prever a variação total do índice daqui a um ano com base nos indicadores atuais.")
+with st.expander("Ver base de dados processada"):
+    st.write(df_full.tail(10))
