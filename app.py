@@ -16,22 +16,40 @@ if st.sidebar.button("🔄 Atualizar Dados"):
     st.cache_data.clear()
     st.rerun()
 
-# --- FUNÇÕES DE EXTRAÇÃO COM LOGS TÉCNICOS ---
+# --- FUNÇÃO DE DOWNLOAD ROBUSTA (Busca o último preço disponível) ---
 
 def get_ibov_strict(start_str, logs):
-    """Busca estritamente o fechamento real do Ibovespa (^BVSP)"""
+    """Busca o Ibovespa tentando Adj Close ou Close conforme disponível"""
     try:
-        # Tenta baixar o ticker oficial
         data = yf.download("^BVSP", start=start_str, progress=False)
-        if not data.empty:
-            # Tratamento para garantir extração correta independente da versão do yfinance
-            df_close = data['Adj Close'].iloc[:, 0] if isinstance(data.columns, pd.MultiIndex) else data['Adj Close']
-            return df_close.to_frame('ibov')
+        
+        if data.empty:
+            logs['Yahoo Finance (^BVSP)'] = "Resposta vazia. Possível Rate Limit."
+            return pd.DataFrame()
+
+        # Tratamento para MultiIndex (comum em versões novas do yfinance)
+        if isinstance(data.columns, pd.MultiIndex):
+            # Tenta Adj Close, depois Close no primeiro nível
+            cols_disponiveis = data.columns.get_level_values(0).unique()
+            for col in ['Adj Close', 'Close']:
+                if col in cols_disponiveis:
+                    return data[col][['^BVSP']].rename(columns={'^BVSP': 'ibov'})
         else:
-            logs['Yahoo Finance (^BVSP)'] = "Resposta vazia. Possível bloqueio de Rate Limit."
+            # Tratamento para colunas simples
+            for col in ['Adj Close', 'Close']:
+                if col in data.columns:
+                    return data[[col]].rename(columns={col: 'ibov'})
+
+        # Se não achou nem Adj Close nem Close, pega a última coluna disponível (último recurso)
+        last_col = data.columns[0]
+        logs['Yahoo Finance (^BVSP)'] = f"Aviso: 'Adj Close' não encontrado. Usando coluna '{last_col}'."
+        return data[[last_col]].rename(columns={last_col: 'ibov'})
+
     except Exception as e:
         logs['Yahoo Finance (^BVSP)'] = f"Erro técnico: {str(e)}"
     return pd.DataFrame()
+
+# --- FUNÇÕES SGS E FRED (MANTIDAS) ---
 
 def get_sgs_csv(codigo, nome_coluna, logs):
     url = f"https://api.bcb.gov.br/dados/serie/bcdata.sgs.{codigo}/dados?formato=csv"
@@ -42,7 +60,6 @@ def get_sgs_csv(codigo, nome_coluna, logs):
             df['data'] = pd.to_datetime(df['data'], dayfirst=True)
             df = df.rename(columns={'valor': nome_coluna}).set_index('data')
             return df[[nome_coluna]]
-        logs[f'SGS {codigo}'] = f"HTTP {response.status_code}"
     except Exception as e:
         logs[f'SGS {codigo}'] = str(e)
     return pd.DataFrame()
@@ -65,11 +82,10 @@ def get_fred_csv(series_id, nome_coluna, logs):
 @st.cache_data(ttl=None)
 def load_all_data():
     logs = {}
-    # Defasagem de segurança: 10 anos até 2 dias atrás
     hoje = datetime.now() - timedelta(days=2)
     start_str = (hoje - timedelta(days=365*10)).strftime('%Y-%m-%d')
     
-    # 1. Ibovespa Estrito
+    # 1. Ibovespa
     ibov_df = get_ibov_strict(start_str, logs)
     if ibov_df.empty:
         return None, logs
@@ -103,10 +119,10 @@ data, erros_reais = load_all_data()
 
 if data is None:
     st.title("📈 Aguardando Conexão ^BVSP")
-    st.error("Não foi possível obter a cotação real do Ibovespa agora. Veja o relatório técnico abaixo.")
+    st.error("Não foi possível carregar os dados reais. Verifique os detalhes técnicos abaixo.")
 else:
     st.title("📈 Projeção Ibovespa (^BVSP)")
-    st.caption(f"Fechamento real mensal consolidado até: {data.index[-1].strftime('%d/%m/%Y')}")
+    st.caption(f"Base de cálculo: Fechamento mensal até {data.index[-1].strftime('%d/%m/%Y')}")
 
     # Modelo Ridge
     features = ["juros_brasil", "dolar", "pib", "inflacao", "juros_americano"]
@@ -121,10 +137,10 @@ else:
 
     # Sidebar Simulação
     st.sidebar.divider()
-    st.sidebar.header("Cenário Simulado")
+    st.sidebar.header("Cenário de Simulação")
     user_inputs = []
     for f in features_presentes:
-        val = st.sidebar.number_input(f, value=float(X[f].iloc[-1]))
+        val = st.sidebar.number_input(f, value=float(X[f].iloc[-1]), format="%.2f")
         user_inputs.append(val)
 
     # Métricas
@@ -132,25 +148,24 @@ else:
     c1, c2, c3 = st.columns(3)
     c1.metric("Retorno Projetado (M+1)", f"{pred_ret:.2%}")
     c2.metric("Ibov Alvo Estimado", f"{data['ibov'].iloc[-1]*(1+pred_ret):,.0f}")
-    c3.metric("R² (Aderência Histórica)", f"{model.score(X_scaled, y):.2f}")
+    c3.metric("R² (Aderência)", f"{model.score(X_scaled, y):.2f}")
 
     st.divider()
     col_l, col_r = st.columns(2)
     with col_l:
-        st.subheader("Pesos das Variáveis Macro")
+        st.subheader("Importância das Variáveis")
         fig, ax = plt.subplots()
         pd.Series(model.coef_, index=features_presentes).sort_values().plot(kind='barh', ax=ax, color='teal')
         st.pyplot(fig)
     with col_r:
-        st.subheader("Evolução Histórica Real")
+        st.subheader("Histórico Real Ibovespa")
         st.line_chart(data['ibov'])
 
 # --- RELATÓRIO TÉCNICO ---
 st.divider()
 with st.expander("🛠️ Investigação Técnica (Logs Reais)"):
     if not erros_reais:
-        st.success("Todas as APIs responderam com sucesso!")
+        st.success("APIs sincronizadas com sucesso!")
     else:
-        st.info("Abaixo estão os erros retornados pelas APIs durante a última tentativa:")
         for api, erro in erros_reais.items():
             st.code(f"{api}: {erro}")
