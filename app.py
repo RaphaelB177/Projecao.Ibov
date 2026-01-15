@@ -4,54 +4,23 @@ import numpy as np
 import yfinance as yf
 from sklearn.linear_model import Ridge
 from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import mean_squared_error, mean_absolute_error
 import matplotlib.pyplot as plt
 from datetime import datetime, timedelta
 import io
 import requests
 
-st.set_page_config(layout="wide", page_title="Ibov Projeção Real", page_icon="📈")
+# -------------------
+# Configurações e Cache
+# -------------------
+st.set_page_config(layout="wide", page_title="Ibov Projeção Estatística")
 
-# --- BOTÃO DE REFRESH ---
-if st.sidebar.button("🔄 Atualizar Dados"):
+if st.sidebar.button("🔄 Atualizar Base de Dados"):
     st.cache_data.clear()
     st.rerun()
 
-# --- FUNÇÃO DE DOWNLOAD ROBUSTA (Busca o último preço disponível) ---
-
-def get_ibov_strict(start_str, logs):
-    """Busca o Ibovespa tentando Adj Close ou Close conforme disponível"""
-    try:
-        data = yf.download("^BVSP", start=start_str, progress=False)
-        
-        if data.empty:
-            logs['Yahoo Finance (^BVSP)'] = "Resposta vazia. Possível Rate Limit."
-            return pd.DataFrame()
-
-        # Tratamento para MultiIndex (comum em versões novas do yfinance)
-        if isinstance(data.columns, pd.MultiIndex):
-            # Tenta Adj Close, depois Close no primeiro nível
-            cols_disponiveis = data.columns.get_level_values(0).unique()
-            for col in ['Adj Close', 'Close']:
-                if col in cols_disponiveis:
-                    return data[col][['^BVSP']].rename(columns={'^BVSP': 'ibov'})
-        else:
-            # Tratamento para colunas simples
-            for col in ['Adj Close', 'Close']:
-                if col in data.columns:
-                    return data[[col]].rename(columns={col: 'ibov'})
-
-        # Se não achou nem Adj Close nem Close, pega a última coluna disponível (último recurso)
-        last_col = data.columns[0]
-        logs['Yahoo Finance (^BVSP)'] = f"Aviso: 'Adj Close' não encontrado. Usando coluna '{last_col}'."
-        return data[[last_col]].rename(columns={last_col: 'ibov'})
-
-    except Exception as e:
-        logs['Yahoo Finance (^BVSP)'] = f"Erro técnico: {str(e)}"
-    return pd.DataFrame()
-
-# --- FUNÇÕES SGS E FRED (MANTIDAS) ---
-
-def get_sgs_csv(codigo, nome_coluna, logs):
+# Funções de extração resilientes (estratégia atual)
+def get_sgs_csv(codigo, nome_coluna):
     url = f"https://api.bcb.gov.br/dados/serie/bcdata.sgs.{codigo}/dados?formato=csv"
     try:
         response = requests.get(url, timeout=15)
@@ -60,112 +29,107 @@ def get_sgs_csv(codigo, nome_coluna, logs):
             df['data'] = pd.to_datetime(df['data'], dayfirst=True)
             df = df.rename(columns={'valor': nome_coluna}).set_index('data')
             return df[[nome_coluna]]
-    except Exception as e:
-        logs[f'SGS {codigo}'] = str(e)
+    except: pass
     return pd.DataFrame()
-
-def get_fred_csv(series_id, nome_coluna, logs):
-    url = f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={series_id}"
-    try:
-        df = pd.read_csv(url)
-        df.columns = [c.upper() for c in df.columns]
-        if 'DATE' in df.columns:
-            df['DATE'] = pd.to_datetime(df['DATE'])
-            df = df.rename(columns={series_id: nome_coluna}).set_index('DATE')
-            return df[[nome_coluna]]
-    except Exception as e:
-        logs[f'FRED {series_id}'] = str(e)
-    return pd.DataFrame()
-
-# --- CARREGAMENTO CENTRAL ---
 
 @st.cache_data(ttl=None)
-def load_all_data():
-    logs = {}
+def load_data_full():
     hoje = datetime.now() - timedelta(days=2)
     start_str = (hoje - timedelta(days=365*10)).strftime('%Y-%m-%d')
     
-    # 1. Ibovespa
-    ibov_df = get_ibov_strict(start_str, logs)
-    if ibov_df.empty:
-        return None, logs
+    # Ibov Real
+    ibov_raw = yf.download("^BVSP", start=start_str, progress=False)
+    ibov = ibov_raw['Adj Close'].iloc[:,0] if isinstance(ibov_raw.columns, pd.MultiIndex) else ibov_raw['Adj Close']
+    df = ibov.resample('ME').last().to_frame('ibov')
+
+    # Dados Macro
+    dolar = get_sgs_csv(1, 'dolar')
+    ipca = get_sgs_csv(433, 'inflacao')
+    selic = get_sgs_csv(4390, 'juros_brasil')
+    pib = get_sgs_csv(438, 'pib')
     
-    ibov_mensal = ibov_df.resample('ME').last()
-
-    # 2. Dados Macro (D-2)
-    dolar = get_sgs_csv(1, 'dolar', logs)
-    ipca = get_sgs_csv(433, 'inflacao', logs)
-    selic = get_sgs_csv(4390, 'juros_brasil', logs)
-    pib = get_sgs_csv(438, 'pib', logs)
-    juros_usa = get_fred_csv('FEDFUNDS', 'juros_americano', logs)
-
-    # 3. Consolidação
-    df = ibov_mensal.copy()
-    for d in [dolar, ipca, selic, pib, juros_usa]:
+    for d in [dolar, ipca, selic, pib]:
         if not d.empty:
             df = df.join(d.resample('ME').last(), how='left')
-
+    
     df = df.ffill().dropna()
-    df['target_ret'] = df['ibov'].pct_change().shift(-1)
-    
-    return df.dropna(), logs
+    df['target_ret'] = df['ibov'].pct_change().shift(-1) # Retorno Ex-Ante
+    return df.dropna()
 
-# Execução
-data, erros_reais = load_all_data()
+df = load_data_full()
 
 # -------------------
-# INTERFACE PRINCIPAL
+# Lógica Estatística (Recuperada do Original)
 # -------------------
+st.title("📈 Projeção Estatística Ibovespa")
 
-if data is None:
-    st.title("📈 Aguardando Conexão ^BVSP")
-    st.error("Não foi possível carregar os dados reais. Verifique os detalhes técnicos abaixo.")
-else:
-    st.title("📈 Projeção Ibovespa (^BVSP)")
-    st.caption(f"Base de cálculo: Fechamento mensal até {data.index[-1].strftime('%d/%m/%Y')}")
+# Sidebar - Parâmetros de Backtest
+st.sidebar.header("Parâmetros Estatísticos")
+window_type = st.sidebar.selectbox("Tipo de Janela:", ["Expanding", "Rolling"])
+rolling_size = st.sidebar.slider("Janela Móvel (meses)", 12, 60, 36)
 
-    # Modelo Ridge
-    features = ["juros_brasil", "dolar", "pib", "inflacao", "juros_americano"]
-    features_presentes = [f for f in features if f in data.columns]
+features = ["juros_brasil", "dolar", "pib", "inflacao"] # Ajustado para o que o BCB entrega estável
+X = df[features]
+y = df["target_ret"]
+
+scaler = StandardScaler()
+X_scaled = scaler.fit_transform(X)
+
+def backtest_ridge_full(X, y, horizon, window_type, size):
+    preds, actuals, t_idx = [], [], []
+    start_idx = 48 # Mínimo de 4 anos
     
-    X = data[features_presentes]
-    y = data["target_ret"]
-    
-    scaler = StandardScaler()
-    X_scaled = scaler.fit_transform(X)
-    model = Ridge(alpha=1.0).fit(X_scaled, y)
+    for i in range(start_idx, len(y) - horizon + 1):
+        X_train = X[:i] if window_type == "Expanding" else X[i-size:i]
+        y_train = y[:i] if window_type == "Expanding" else y[i-size:i]
+        
+        model = Ridge(alpha=0.5).fit(X_train, y_train)
+        y_pred = model.predict(X[i : i+horizon])
+        
+        preds.extend(y_pred)
+        actuals.extend(y[i : i+horizon])
+        t_idx.extend(y.index[i : i+horizon])
+        
+    res = pd.DataFrame({"Real": actuals, "Previsto": preds}, index=t_idx)
+    rmse = np.sqrt(mean_squared_error(res["Real"], res["Previsto"]))
+    return res, rmse
 
-    # Sidebar Simulação
-    st.sidebar.divider()
-    st.sidebar.header("Cenário de Simulação")
-    user_inputs = []
-    for f in features_presentes:
-        val = st.sidebar.number_input(f, value=float(X[f].iloc[-1]), format="%.2f")
-        user_inputs.append(val)
+# Execução do Backtest
+st.header("1. Avaliação de Performance (Backtest)")
+res_bt, rmse_val = backtest_ridge_full(X_scaled, y, 1, window_type, rolling_size)
 
-    # Métricas
-    pred_ret = model.predict(scaler.transform([user_inputs]))[0]
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Retorno Projetado (M+1)", f"{pred_ret:.2%}")
-    c2.metric("Ibov Alvo Estimado", f"{data['ibov'].iloc[-1]*(1+pred_ret):,.0f}")
-    c3.metric("R² (Aderência)", f"{model.score(X_scaled, y):.2f}")
+col1, col2 = st.columns([2, 1])
+with col1:
+    fig, ax = plt.subplots(figsize=(10, 4))
+    std_err = (res_bt["Real"] - res_bt["Previsto"]).std()
+    ax.plot(res_bt["Real"].cumsum(), label="Real Acumulado", color="black")
+    ax.plot(res_bt["Previsto"].cumsum(), label="Previsto Acumulado", color="blue", linestyle="--")
+    ax.fill_between(res_bt.index, (res_bt["Previsto"] - 1.96*std_err).cumsum(), 
+                    (res_bt["Previsto"] + 1.96*std_err).cumsum(), color='blue', alpha=0.1, label="IC 95%")
+    ax.legend()
+    st.pyplot(fig)
 
-    st.divider()
-    col_l, col_r = st.columns(2)
-    with col_l:
-        st.subheader("Importância das Variáveis")
-        fig, ax = plt.subplots()
-        pd.Series(model.coef_, index=features_presentes).sort_values().plot(kind='barh', ax=ax, color='teal')
-        st.pyplot(fig)
-    with col_r:
-        st.subheader("Histórico Real Ibovespa")
-        st.line_chart(data['ibov'])
+with col2:
+    st.metric("RMSE do Modelo", f"{rmse_val:.4f}")
+    st.write("O erro médio quadrático indica a volatilidade da falha do modelo no passado.")
 
-# --- RELATÓRIO TÉCNICO ---
+# -------------------
+# Projeção Atual (Com Inputs do Usuário)
+# -------------------
 st.divider()
-with st.expander("🛠️ Investigação Técnica (Logs Reais)"):
-    if not erros_reais:
-        st.success("APIs sincronizadas com sucesso!")
-    else:
-        for api, erro in erros_reais.items():
-            st.code(f"{api}: {erro}")
+st.header("2. Projeção para o Próximo Mês")
+
+st.sidebar.header("Inputs para Projeção")
+user_vals = []
+for f in features:
+    v = st.sidebar.number_input(f"Valor esperado: {f}", value=float(df[f].iloc[-1]))
+    user_vals.append(v)
+
+model_final = Ridge(alpha=0.5).fit(X_scaled, y)
+pred_user = model_final.predict(scaler.transform([user_vals]))[0]
+
+c1, c2 = st.columns(2)
+c1.metric("Retorno Projetado", f"{pred_ret_user:.2%}")
+c2.metric("Preço Estimado", f"{df['ibov'].iloc[-1]*(1+pred_user):,.0f}")
+
+st.write(f"**Intervalo de Incerteza (95%):** [{(pred_user - 1.96*std_err)*100:.2f}% a {(pred_user + 1.96*std_err)*100:.2f}%]")
