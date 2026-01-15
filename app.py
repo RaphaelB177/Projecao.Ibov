@@ -8,6 +8,7 @@ import matplotlib.pyplot as plt
 from datetime import datetime, timedelta
 import io
 import requests
+import time
 
 st.set_page_config(layout="wide", page_title="Ibov Projeção", page_icon="📈")
 
@@ -16,129 +17,140 @@ if st.sidebar.button("🔄 Atualizar Dados"):
     st.cache_data.clear()
     st.rerun()
 
-# --- FUNÇÕES DE EXTRAÇÃO ROBUSTAS ---
+# --- FUNÇÕES DE EXTRAÇÃO COM LOG SILENCIOSO ---
 
-def get_sgs_csv(codigo, nome_coluna):
-    """Busca dados do BCB e renomeia a coluna imediatamente"""
+def get_ibov_data(start_str, logs):
+    """Tenta baixar Ibovespa; se falhar, tenta EWZ."""
+    tickers = ["^BVSP", "EWZ"]
+    for ticker in tickers:
+        try:
+            data = yf.download(ticker, start=start_str, progress=False)
+            if not data.empty:
+                df_close = data['Adj Close'].iloc[:, 0] if isinstance(data.columns, pd.MultiIndex) else data['Adj Close']
+                return df_close.to_frame('ibov'), ticker
+        except Exception as e:
+            logs['Yahoo Finance'] = f"Erro no ticker {ticker}: {str(e)}"
+    return pd.DataFrame(), None
+
+def get_sgs_csv(codigo, nome_coluna, logs):
     url = f"https://api.bcb.gov.br/dados/serie/bcdata.sgs.{codigo}/dados?formato=csv"
     try:
-        response = requests.get(url, timeout=20)
+        response = requests.get(url, timeout=15)
         if response.status_code == 200:
             df = pd.read_csv(io.StringIO(response.text), sep=';', decimal=',')
             df['data'] = pd.to_datetime(df['data'], dayfirst=True)
-            df = df.rename(columns={'valor': nome_coluna})
-            df.set_index('data', inplace=True)
+            df = df.rename(columns={'valor': nome_coluna}).set_index('data')
             return df[[nome_coluna]]
+        else:
+            logs[f'SGS {codigo}'] = f"Status Code: {response.status_code}"
     except Exception as e:
-        st.sidebar.warning(f"SGS {codigo} ({nome_coluna}) offline. Usando último disponível.")
+        logs[f'SGS {codigo}'] = str(e)
     return pd.DataFrame()
 
-def get_fred_csv(series_id, nome_coluna):
-    """Busca dados do FRED e trata erro de índice"""
+def get_fred_csv(series_id, nome_coluna, logs):
     url = f"https://fred.stlouisfed.org/graph/fredgraph.csv?id={series_id}"
     try:
         df = pd.read_csv(url)
-        # O FRED costuma usar 'DATE' ou 'date'. Vamos forçar:
         df.columns = [c.upper() for c in df.columns]
         if 'DATE' in df.columns:
             df['DATE'] = pd.to_datetime(df['DATE'])
-            df = df.rename(columns={series_id: nome_coluna})
-            df.set_index('DATE', inplace=True)
+            df = df.rename(columns={series_id: nome_coluna}).set_index('DATE')
             return df[[nome_coluna]]
     except Exception as e:
-        st.sidebar.warning(f"FRED {series_id} offline.")
+        logs[f'FRED {series_id}'] = str(e)
     return pd.DataFrame()
 
-# --- CARREGAMENTO DE DADOS ---
+# --- CARREGAMENTO CENTRAL ---
 
-@st.cache_data(ttl=None, show_spinner="📦 Sincronizando indicadores macro...")
+@st.cache_data(ttl=None)
 def load_all_data():
-    # 1. Definir datas (Janela de 10 anos até 2 dias atrás para segurança)
+    logs = {} # Dicionário para capturar erros sem exibir avisos
     hoje = datetime.now() - timedelta(days=2)
-    dez_anos_atras = hoje - timedelta(days=365*10)
-    start_str = dez_anos_atras.strftime('%Y-%m-%d')
-    end_str = hoje.strftime('%Y-%m-%d')
+    start_str = (hoje - timedelta(days=365*10)).strftime('%Y-%m-%d')
     
-    # 2. Ibovespa (Yahoo Finance) - Tenta pegar o máximo possível
-    try:
-        ibov_raw = yf.download("^BVSP", start=start_str, end=datetime.now().strftime('%Y-%m-%d'), progress=False)
-        if isinstance(ibov_raw.columns, pd.MultiIndex):
-            ibov = ibov_raw['Adj Close'].iloc[:, 0]
-        else:
-            ibov = ibov_raw['Adj Close']
-        ibov_mensal = ibov.resample('ME').last().to_frame('ibov')
-    except:
-        st.error("Erro fatal: Yahoo Finance não respondeu.")
-        st.stop()
+    # 1. Ibovespa
+    ibov_df, ticker_usado = get_ibov_data(start_str, logs)
+    if ibov_df.empty:
+        return None, None, logs
+    
+    ibov_mensal = ibov_df.resample('ME').last()
 
-    # 3. Extração Individual com Renomeação (Evita Overlap)
-    dolar = get_sgs_csv(1, 'dolar')
-    ipca = get_sgs_csv(433, 'inflacao')
-    selic = get_sgs_csv(4390, 'juros_brasil')
-    pib = get_sgs_csv(438, 'pib')
-    juros_usa = get_fred_csv('FEDFUNDS', 'juros_americano')
+    # 2. Dados Macro
+    dolar = get_sgs_csv(1, 'dolar', logs)
+    ipca = get_sgs_csv(433, 'inflacao', logs)
+    selic = get_sgs_csv(4390, 'juros_brasil', logs)
+    pib = get_sgs_csv(438, 'pib', logs)
+    juros_usa = get_fred_csv('FEDFUNDS', 'juros_americano', logs)
 
-    # 4. Consolidação via Join (Agora sem erro de colunas iguais)
+    # 3. Join
     df = ibov_mensal.copy()
-    
-    lista_dfs = [dolar, ipca, selic, pib, juros_usa]
-    for d in lista_dfs:
+    for d in [dolar, ipca, selic, pib, juros_usa]:
         if not d.empty:
-            # Resample para mensal para alinhar com Ibov
-            d_mensal = d.resample('ME').last()
-            df = df.join(d_mensal, how='left')
+            df = df.join(d.resample('ME').last(), how='left')
 
-    # Tratamento final: preenche buracos e remove nulos iniciais
     df = df.ffill().dropna()
-    
-    # Target: Retorno do mês seguinte
     df['target_ret'] = df['ibov'].pct_change().shift(-1)
-    return df.dropna()
+    
+    return df.dropna(), ticker_label_map(ticker_usado), logs
 
-# --- EXECUÇÃO ---
+def ticker_label_map(t):
+    return "Ibovespa (^BVSP)" if t == "^BVSP" else "Proxy Brasil (EWZ)"
 
-data = load_all_data()
+# Execução
+data, ticker_info, erros_reais = load_all_data()
 
-st.title("📈 Projeção Ibovespa (Defasagem de Segurança)")
-st.info(f"Dados sincronizados até: {data.index[-1].strftime('%d/%m/%Y')} (D-2 aplicado)")
+# -------------------
+# DASHBOARD
+# -------------------
 
-# --- MODELO RIDGE ---
-features = ["juros_brasil", "dolar", "pib", "inflacao", "juros_americano"]
-# Verifica se todas as colunas existem antes de treinar
-features_presentes = [f for f in features if f in data.columns]
+if data is None:
+    st.title("📈 Sistema Temporariamente Indisponível")
+    st.warning("Não foi possível carregar o Ibovespa. Verifique o relatório de erros abaixo.")
+else:
+    st.title("📈 Projeção Ibovespa")
+    st.caption(f"Dados via {ticker_info} | Sincronizado até: {data.index[-1].strftime('%d/%m/%Y')}")
 
-X = data[features_presentes]
-y = data["target_ret"]
+    # Modelo Ridge
+    features = ["juros_brasil", "dolar", "pib", "inflacao", "juros_americano"]
+    features_presentes = [f for f in features if f in data.columns]
+    
+    X = data[features_presentes]
+    y = data["target_ret"]
+    
+    scaler = StandardScaler()
+    X_scaled = scaler.fit_transform(X)
+    model = Ridge(alpha=1.0).fit(X_scaled, y)
 
-scaler = StandardScaler()
-X_scaled = scaler.fit_transform(X)
-model = Ridge(alpha=1.0).fit(X_scaled, y)
+    # Sidebar Simulação
+    st.sidebar.divider()
+    st.sidebar.header("Cenário Simulado")
+    user_inputs = []
+    for f in features_presentes:
+        val = st.sidebar.number_input(f, value=float(X[f].iloc[-1]))
+        user_inputs.append(val)
 
-# --- SIDEBAR ---
-st.sidebar.header("Simular Próximo Mês")
-user_inputs = []
-for f in features_presentes:
-    val = st.sidebar.number_input(f"Valor para {f}", value=float(X[f].iloc[-1]), format="%.2f")
-    user_inputs.append(val)
+    # Métricas
+    pred_ret = model.predict(scaler.transform([user_inputs]))[0]
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Retorno Projetado", f"{pred_ret:.2%}")
+    c2.metric("Ibov Alvo", f"{data['ibov'].iloc[-1]*(1+pred_ret):,.0f}")
+    c3.metric("Aderência (R²)", f"{model.score(X_scaled, y):.2f}")
 
-# --- RESULTADOS ---
-pred_ret = model.predict(scaler.transform([user_inputs]))[0]
+    st.divider()
+    col_l, col_r = st.columns(2)
+    with col_l:
+        fig, ax = plt.subplots()
+        pd.Series(model.coef_, index=features_presentes).sort_values().plot(kind='barh', ax=ax, color='teal')
+        st.pyplot(fig)
+    with col_r:
+        st.line_chart(data['ibov'])
 
-c1, c2, c3 = st.columns(3)
-c1.metric("Retorno Projetado", f"{pred_ret:.2%}")
-c2.metric("Ibov Alvo", f"{data['ibov'].iloc[-1]*(1+pred_ret):,.0f}")
-c3.metric("R² do Modelo", f"{model.score(X_scaled, y):.2f}")
-
-# --- GRÁFICOS ---
+# --- ÁREA DE DEBUG (ESCONDIDA) ---
 st.divider()
-col_l, col_r = st.columns(2)
-
-with col_l:
-    st.subheader("Pesos do Modelo")
-    fig, ax = plt.subplots()
-    pd.Series(model.coef_, index=features_presentes).sort_values().plot(kind='barh', ax=ax, color='teal')
-    st.pyplot(fig)
-
-with col_r:
-    st.subheader("Evolução Ibovespa")
-    st.line_chart(data['ibov'])
+with st.expander("🛠️ Relatório Técnico de Erros (Investigação)"):
+    if not erros_reais:
+        st.success("Nenhum erro técnico detectado nas últimas requisições!")
+    else:
+        st.write("Abaixo estão os erros reais retornados pelas APIs:")
+        for api, erro in erros_reais.items():
+            st.error(f"**{api}**: {erro}")
